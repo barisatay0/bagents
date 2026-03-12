@@ -27,7 +27,10 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
     // 1. TEAM LEADER PHASE
     let team_lead_prompt = fs::read_to_string("config/team_lead.md")?;
     println!("Team Leader is thinking...");
+
     let lead_raw = llm_client::ask(&team_lead_prompt, &issue_text).await?;
+
+    println!("--- LLM Response ---  {} ----------------------", lead_raw);
 
     let lead_res: TeamLeaderResponse =
         serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
