@@ -47,3 +47,20 @@ pub fn get_diff_against_main() -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
+
+pub fn push_to_remote(branch_name: &str) -> Result<(), String> {
+    println!("Pushing branch '{}' to remote (via SSH)...", branch_name);
+
+    let output = Command::new("git")
+        .args(["push", "-u", "origin", branch_name])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "Git push failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}

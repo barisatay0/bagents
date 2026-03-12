@@ -80,7 +80,20 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
     if rev_res.is_approved {
         println!("REVIEW APPROVED: Code is clean and production-ready!");
-        // Here you could use Octocrab to create a PR automatically.
+
+        git_local::push_to_remote(&dev_res.branch_name)?;
+
+        println!("Opening Pull Request on GitHub...");
+        let pr_title = format!("Resolve Issue #{} - Auto AI PR", target_issue.number);
+        let pr_body = format!(
+            "**Automated PR by AI Software Factory**  **Agent Thought Process:** {}  **Reviewer Notes:** Approved automatically.",
+            dev_res.thought_process
+        );
+
+        match github::create_pull_request(&pr_title, &pr_body, &dev_res.branch_name, "main").await {
+            Ok(url) => println!("🎉 BOOM! Pull Request opened successfully: {}", url),
+            Err(e) => println!("⚠️ Failed to open PR: {}", e),
+        }
     } else {
         println!("❌ REVIEW REJECTED: Changes required.");
         if let Some(feedback) = rev_res.feedback_thread {
