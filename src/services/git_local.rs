@@ -86,3 +86,28 @@ pub fn push_to_remote(branch_name: &str) -> Result<(), String> {
     }
     Ok(())
 }
+
+pub fn reset_to_main() -> Result<(), String> {
+    let workspace = get_workspace();
+    println!("Resetting workspace to main branch...");
+
+    Command::new("git")
+        .current_dir(&workspace)
+        .args(["reset", "--hard"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    Command::new("git")
+        .current_dir(&workspace)
+        .args(["checkout", "main"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    Command::new("git")
+        .current_dir(&workspace)
+        .args(["pull", "origin", "main"])
+        .output()
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
