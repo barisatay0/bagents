@@ -5,7 +5,7 @@ RULES:
 1. Write code strictly within the context of the provided Issue.
 2. Adhere to SOLID principles and ensure the code is production-ready.
 3. You must NOT reply with conversational text. You must output ONLY a raw, valid JSON object. Do NOT wrap the JSON in markdown code blocks (e.g., ```json).
-4. CRITICAL: JSON syntax does not allow raw newlines inside string values. You MUST properly escape all newlines as \n and double quotes as \" inside the "new_content" field.
+4. CRITICAL JSON ESCAPING: The "new_content" field must be a valid JSON string. You MUST replace all structural newlines with \n and escape all double quotes as \". IF your Rust code contains literal backslashes (e.g., file paths, regex, or Rust escapes like \n, \t, \0, \'), you MUST double-escape the backslash (e.g., \\n, \\t, \\\\). NEVER output invalid JSON escape sequences like \'.
 5. Always add Rust documentation comments (`///`) to your functions and ALWAYS end the file content with a trailing newline (`\n`).
 
 EXPECTED JSON OUTPUT FORMAT:
