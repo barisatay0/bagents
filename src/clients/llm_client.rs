@@ -1,6 +1,7 @@
-use reqwest::Client;
-use serde_json::{Value, json};
+use reqwest::{Client, StatusCode};
+use serde_json::{json, Value};
 use std::env;
+use tokio::time::{sleep, Duration};
 
 use crate::helpers::helper_output::output;
 
@@ -28,28 +29,57 @@ pub async fn ask(
 
     let payload = serde_json::to_string(&body)?;
 
-    let res = client
-        .post(&url)
-        .bearer_auth(api_key)
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(payload)
-        .send()
-        .await?;
+    let mut retries = 0;
+    let max_retries = 5;
 
-    let res_text = res.text().await?;
-    let res_json: Value = serde_json::from_str(&res_text)?;
+    loop {
+        let res = client
+            .post(&url)
+            .bearer_auth(&api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload.clone())
+            .send()
+            .await?;
 
-    if res_json["error"].is_object() {
-        let err_msg = res_json["error"]["message"]
+        let status = res.status();
+        let res_text = res.text().await?;
+
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || res_text.to_lowercase().contains("rate limit")
+            || res_text.to_lowercase().contains("try again in")
+        {
+            if retries >= max_retries {
+                return Err(format!(
+                    "LLM API Error (Rate Limit hit {} times): {}",
+                    max_retries, res_text
+                )
+                .into());
+            }
+
+            println!(
+                "API Rate Limit hit! Factory is taking a 15-second coffee break... ({}/{})",
+                retries + 1,
+                max_retries
+            );
+            sleep(Duration::from_secs(15)).await;
+            retries += 1;
+            continue;
+        }
+
+        let res_json: Value = serde_json::from_str(&res_text)?;
+
+        if res_json["error"].is_object() {
+            let err_msg = res_json["error"]["message"]
+                .as_str()
+                .unwrap_or("Unknown API Error");
+            return Err(format!("LLM API Error: {}", err_msg).into());
+        }
+
+        let raw_content = res_json["choices"][0]["message"]["content"]
             .as_str()
-            .unwrap_or("Unknown API Error");
-        return Err(format!("LLM API Error: {}", err_msg).into());
+            .unwrap_or("")
+            .to_string();
+
+        return Ok(output(&raw_content));
     }
-
-    let raw_content = res_json["choices"][0]["message"]["content"]
-        .as_str()
-        .unwrap_or("")
-        .to_string();
-
-    Ok(output(&raw_content))
 }

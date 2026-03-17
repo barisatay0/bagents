@@ -84,14 +84,15 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
             let dev_input = if feedback_history.is_empty() {
                 format!(
-                    "Project Context: You are working on the repository '{}/{}'.  Issue: {}  Architectural Plan: {}",
-                    repo_owner, repo_name, issue_text, lead_res.architectural_plan
+                    "Project Context: You are working on the repository '{}/{}'.  {}  Issue: {} Architectural Plan: {}",
+                    repo_owner, repo_name, repo_context, issue_text, lead_res.architectural_plan
                 )
             } else {
                 format!(
-                    "Project Context: You are working on the repository '{}/{}'.  Issue: {}  Architectural Plan: {}  REVIEWER FEEDBACK TO FIX: {}",
+                    "Project Context: You are working on the repository '{}/{}'.  {}  Issue: {} Architectural Plan: {}   REVIEWER FEEDBACK TO FIX: {}",
                     repo_owner,
                     repo_name,
+                    repo_context,
                     issue_text,
                     lead_res.architectural_plan,
                     feedback_history
@@ -99,8 +100,25 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let dev_raw = llm_client::ask(&dev_prompt, &dev_input).await?;
-            let dev_res: DeveloperResponse =
-                serde_json::from_str(&dev_raw).expect("Failed to parse Developer JSON");
+
+            let dev_res: DeveloperResponse = match serde_json::from_str(&dev_raw) {
+                Ok(res) => res,
+                Err(e) => {
+                    println!("LLM generated invalid JSON: {}. Forcing retry...", e);
+
+                    feedback_history = format!(
+                        "CRITICAL SYSTEM ERROR: Your last response was NOT valid JSON. The parser failed with: '{}'. You MUST strictly follow the JSON formatting rules, properly escape all double quotes (\\\") and newlines (\\n), and ensure the JSON is complete.",
+                        e
+                    );
+
+                    attempt += 1;
+                    if attempt > max_attempts {
+                        println!("🚨 MAX ATTEMPTS REACHED due to JSON parsing errors.");
+                        break;
+                    }
+                    continue;
+                }
+            };
 
             println!("Dev Thought: {}", dev_res.thought_process);
 
@@ -117,7 +135,10 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             println!(" Reviewer is analyzing the code...");
             let reviewer_prompt = fs::read_to_string("config/reviewer.md")?;
             let git_diff = git_local::get_diff_against_main().unwrap_or_default();
-            let reviewer_input = format!("Here is the git diff for the new feature: {}", git_diff);
+            let reviewer_input = format!(
+                "Issue being solved: {}  Here is the git diff for the new feature: {}",
+                issue_text, git_diff
+            );
 
             let rev_raw = llm_client::ask(&reviewer_prompt, &reviewer_input).await?;
             let rev_res: ReviewerResponse =
