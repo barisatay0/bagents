@@ -51,10 +51,14 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             target_issue.number, target_issue.title
         );
 
+        println!("Reading repository context...");
+        let repo_context = file_system::get_repo_context();
+
         let team_lead_prompt = fs::read_to_string("config/team_lead.md")?;
         println!("Team Leader is thinking...");
 
-        let lead_raw = llm_client::ask(&team_lead_prompt, &issue_text).await?;
+        let team_lead_input = format!("{}  Issue: {}", repo_context, issue_text);
+        let lead_raw = llm_client::ask(&team_lead_prompt, &team_lead_input).await?;
         let lead_res: TeamLeaderResponse =
             serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
 
