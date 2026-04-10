@@ -1,6 +1,7 @@
 use crate::clients::llm_client;
 use crate::models::{
-    developer_response::DeveloperResponse, reviewer_response::ReviewerResponse,
+    developer_response::DeveloperResponse,
+    reviewer_response::ReviewerResponse,
     teamlead_response::TeamLeaderResponse,
 };
 use crate::services::{file_system, git_local, github};
@@ -9,16 +10,16 @@ use std::fs;
 use tokio::time::{Duration, sleep};
 
 pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Factory started! Waiting for issues in continuous mode...");
+    info!("Factory started! Waiting for issues in continuous mode...");
 
     let mut processed_issues: HashSet<u64> = HashSet::new();
 
     loop {
-        println!("Checking GitHub for open issues...");
+        info!("Checking GitHub for open issues...");
         let issues = match github::fetch_open_issues().await {
             Ok(i) => i,
             Err(e) => {
-                println!("GitHub API Error: {}. Retrying later...", e);
+                warn!("GitHub API Error: {}. Retrying later...", e);
                 sleep(Duration::from_secs(60)).await;
                 continue;
             }
@@ -35,7 +36,7 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
         let target_issue = match target_issue {
             Some(issue) => issue,
             None => {
-                println!(" No new open issues found. Factory is resting for 30 seconds...");
+                info!(" No new open issues found. Factory is resting for 30 seconds...");
                 sleep(Duration::from_secs(30)).await;
                 continue;
             }
@@ -46,28 +47,25 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
         let issue_body = target_issue.body.clone().unwrap_or_default();
         let issue_text = format!("Title: {} Body: {}", target_issue.title, issue_body);
 
-        println!(
-            " ======================================== Processing Issue #{}: {} ========================================",
-            target_issue.number, target_issue.title
-        );
+        info!("======================================= Processing Issue #{}: {} =======================================", target_issue.number, target_issue.title);
 
-        println!("Reading repository context...");
+        info!("Reading repository context...");
         let repo_context = file_system::get_repo_context();
 
-        let team_lead_prompt = fs::read_to_string("config/team_lead.md")?;
-        println!("Team Leader is thinking...");
+        let team_lead_prompt = fs::read_to_string("config/team_lead.md").unwrap();
+        info!("Team Leader is thinking...");
 
         let team_lead_input = format!("{}  Issue: {}", repo_context, issue_text);
         let lead_raw = llm_client::ask(&team_lead_prompt, &team_lead_input).await?;
         let lead_res: TeamLeaderResponse =
             serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
 
-        println!("Agent Assigned: {}", lead_res.assigned_agent);
-        println!("Architecture Plan: {}", lead_res.architectural_plan);
+        info!("Agent Assigned: {}", lead_res.assigned_agent);
+        info!("Architecture Plan: {}", lead_res.architectural_plan);
 
         let dev_prompt_path = format!("config/{}.md", lead_res.assigned_agent);
         let dev_prompt = fs::read_to_string(&dev_prompt_path).unwrap_or_else(|_| {
-            println!("Agent config not found, falling back to backend_dev");
+            info!("Agent config not found, falling back to backend_dev");
             fs::read_to_string("config/backend_dev.md").unwrap()
         });
 
@@ -79,13 +77,17 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
         let max_attempts = 3;
 
         loop {
-            println!(" [ATTEMPT {}/{}]", attempt, max_attempts);
-            println!(" {} is writing/fixing code...", lead_res.assigned_agent);
+            info!(" [ATTEMPT {}/{}]", attempt, max_attempts);
+            info!(" {} is writing/fixing code...", lead_res.assigned_agent);
 
             let dev_input = if feedback_history.is_empty() {
                 format!(
                     "Project Context: You are working on the repository '{}/{}'.  {}  Issue: {} Architectural Plan: {}",
-                    repo_owner, repo_name, repo_context, issue_text, lead_res.architectural_plan
+                    repo_owner,
+                    repo_name,
+                    repo_context,
+                    issue_text,
+                    lead_res.architectural_plan
                 )
             } else {
                 format!(
@@ -104,7 +106,7 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             let dev_res: DeveloperResponse = match serde_json::from_str(&dev_raw) {
                 Ok(res) => res,
                 Err(e) => {
-                    println!("LLM generated invalid JSON: {}. Forcing retry...", e);
+                    error!("LLM generated invalid JSON: {}. Forcing retry...", e);
 
                     feedback_history = format!(
                         "CRITICAL SYSTEM ERROR: Your last response was NOT valid JSON. The parser failed with: '{}'. You MUST strictly follow the JSON formatting rules, properly escape all double quotes (\\\") and newlines (\\n), and ensure the JSON is complete.",
@@ -113,31 +115,33 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
                     attempt += 1;
                     if attempt > max_attempts {
-                        println!("🚨 MAX ATTEMPTS REACHED due to JSON parsing errors.");
+                        info!("\\\u{1F6AB} MAX ATTEMPTS REACHED due to JSON parsing errors.");
                         break;
                     }
                     continue;
                 }
             };
 
-            println!("Dev Thought: {}", dev_res.thought_process);
+            info!("Dev Thought: {}", dev_res.thought_process);
 
             git_local::create_branch(&dev_res.branch_name)?;
             file_system::apply_modifications(dev_res.files_to_modify)?;
 
             let commit_msg = format!(
                 "feat: Resolve issue #{} (Attempt {})",
-                target_issue.number, attempt
+                target_issue.number,
+                attempt
             );
             let _ = git_local::commit_changes(&commit_msg);
 
             // 4. REVIEWER PHASE
-            println!(" Reviewer is analyzing the code...");
-            let reviewer_prompt = fs::read_to_string("config/reviewer.md")?;
+            info!("Starting review phase: Code Reviewer is analyzing the git diff for branch '{}'", dev_res.branch_name);
+            let reviewer_prompt = fs::read_to_string("config/reviewer.md").unwrap();
             let git_diff = git_local::get_diff_against_main().unwrap_or_default();
             let reviewer_input = format!(
                 "Issue being solved: {}  Here is the git diff for the new feature: {}",
-                issue_text, git_diff
+                issue_text,
+                git_diff
             );
 
             let rev_raw = llm_client::ask(&reviewer_prompt, &reviewer_input).await?;
@@ -145,50 +149,50 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::from_str(&rev_raw).expect("Failed to parse Reviewer JSON");
 
             if rev_res.is_approved {
-                println!(" REVIEW APPROVED: Code is clean and production-ready!");
+                info!("\\\u{1F44D} REVIEW APPROVED: Code is clean and production-ready!");
                 git_local::push_to_remote(&dev_res.branch_name)?;
 
-                println!(" Opening Pull Request on GitHub...");
+                info!("Opening Pull Request on GitHub...");
                 let pr_title = format!("Resolve Issue #{} - Auto AI PR", target_issue.number);
                 let pr_body = format!(
                     " **Automated PR by AI Software Factory**  **Agent Thought Process:** {}  **Reviewer Notes:** Approved after {} attempts.  Closes #{}",
-                    dev_res.thought_process, attempt, target_issue.number
+                    dev_res.thought_process,
+                    attempt,
+                    target_issue.number
                 );
 
                 match github::create_pull_request(&pr_title, &pr_body, &dev_res.branch_name, "main")
                     .await
                 {
-                    Ok(url) => println!(" BOOM! Pull Request opened successfully: {}", url),
-                    Err(e) => println!(" Failed to open PR: {}", e),
+                    Ok(url) => info!("\\\u{1F3E1} Pull Request opened successfully: {}", url),
+                    Err(e) => error!("Failed to open PR: {}", e),
                 }
                 break;
             } else {
-                println!("❌ REVIEW REJECTED: Changes required.");
+                warn!("\\\u{1F6AB} REVIEW REJECTED: Changes required.");
                 if let Some(feedback) = rev_res.feedback_thread {
-                    println!(" Feedback: {}", feedback);
+                    info!("Feedback: {}", feedback);
                     feedback_history = feedback.clone();
 
-                    println!(" Posting Reviewer feedback to GitHub Issue...");
+                    info!("Posting Reviewer feedback to GitHub Issue...");
                     let comment_body = format!(
                         "** Reviewer Feedback (Attempt {}):** {}",
-                        attempt, feedback_history
+                        attempt,
+                        feedback_history
                     );
                     let _ = github::create_issue_comment(target_issue.number, &comment_body).await;
                 }
 
                 attempt += 1;
                 if attempt > max_attempts {
-                    println!(" MAX ATTEMPTS REACHED! Halting feedback loop.");
+                    info!("\\\u{1F6AB} MAX ATTEMPTS REACHED! Halting feedback loop.");
                     break;
                 }
             }
         }
 
         processed_issues.insert(target_issue.number);
-        println!(
-            " Workflow completed for Issue #{}. Adding to memory.",
-            target_issue.number
-        );
+        info!("Workflow completed for Issue #{}. Adding to memory.", target_issue.number);
 
         sleep(Duration::from_secs(10)).await;
     }

@@ -7,10 +7,7 @@ fn get_workspace() -> String {
 
 pub fn create_branch(branch_name: &str) -> Result<(), String> {
     let workspace = get_workspace();
-    println!(
-        "Creating git branch '{}' in workspace: {}",
-        branch_name, workspace
-    );
+    info!("Creating git branch '{}' in workspace: {}", branch_name, workspace);
 
     let output = Command::new("git")
         .current_dir(&workspace)
@@ -30,7 +27,7 @@ pub fn create_branch(branch_name: &str) -> Result<(), String> {
 
 pub fn commit_changes(message: &str) -> Result<(), String> {
     let workspace = get_workspace();
-    println!("Committing changes in workspace...");
+    info!("Committing changes in workspace...");
 
     Command::new("git")
         .current_dir(&workspace)
@@ -67,10 +64,7 @@ pub fn get_diff_against_main() -> Result<String, String> {
 
 pub fn push_to_remote(branch_name: &str) -> Result<(), String> {
     let workspace = get_workspace();
-    println!(
-        "Pushing branch '{}' from workspace to remote...",
-        branch_name
-    );
+    info!("Pushing branch '{}' from workspace to remote...", branch_name);
 
     let output = Command::new("git")
         .current_dir(&workspace)
@@ -89,7 +83,7 @@ pub fn push_to_remote(branch_name: &str) -> Result<(), String> {
 
 pub fn reset_to_main() -> Result<(), String> {
     let workspace = get_workspace();
-    println!("Resetting workspace to main branch...");
+    info!("Resetting workspace to main branch...");
 
     Command::new("git")
         .current_dir(&workspace)
