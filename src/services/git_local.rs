@@ -1,113 +1,94 @@
-use std::env;
 use std::process::Command;
+use tracing::{debug, info, warn};
 
-fn get_workspace() -> String {
-    env::var("WORKSPACE_DIR").expect("WORKSPACE_DIR missing in .env")
-}
+use crate::config::Config;
 
-pub fn create_branch(branch_name: &str) -> Result<(), String> {
-    let workspace = get_workspace();
-    println!(
-        "Creating git branch '{}' in workspace: {}",
-        branch_name, workspace
-    );
+/// Checkout a new branch in the workspace, or switch to it if it already exists.
+pub fn create_branch(config: &Config, branch_name: &str) -> Result<(), String> {
+    info!(branch = branch_name, "Creating git branch");
 
-    let output = Command::new("git")
-        .current_dir(&workspace)
-        .args(["checkout", "-b", branch_name])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        Command::new("git")
-            .current_dir(&workspace)
-            .args(["checkout", branch_name])
-            .output()
-            .map_err(|e| e.to_string())?;
+    let out = run(config, &["checkout", "-b", branch_name])?;
+    if !out.status.success() {
+        // Branch already exists — just switch to it
+        run(config, &["checkout", branch_name])?;
     }
     Ok(())
 }
 
-pub fn commit_changes(message: &str) -> Result<(), String> {
-    let workspace = get_workspace();
-    println!("Committing changes in workspace...");
+/// Stage all changes and commit with the given message.
+/// Succeeds silently when there is nothing to commit.
+pub fn commit_changes(config: &Config, message: &str) -> Result<(), String> {
+    debug!("Staging and committing changes");
 
-    Command::new("git")
-        .current_dir(&workspace)
-        .args(["add", "."])
-        .output()
-        .map_err(|e| e.to_string())?;
+    run(config, &["add", "."])?;
 
-    let output = Command::new("git")
-        .current_dir(&workspace)
-        .args(["commit", "-m", message])
-        .output()
-        .map_err(|e| e.to_string())?;
+    let out = run(config, &["commit", "-m", message])?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    if !output.status.success() && !stdout.contains("nothing to commit") {
+    if !out.status.success() && !stdout.contains("nothing to commit") {
         return Err(format!(
-            "Git commit failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-
-    Ok(())
-}
-
-pub fn get_diff_against_main() -> Result<String, String> {
-    let workspace = get_workspace();
-    let output = Command::new("git")
-        .current_dir(&workspace)
-        .args(["diff", "main"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
-pub fn push_to_remote(branch_name: &str) -> Result<(), String> {
-    let workspace = get_workspace();
-    println!(
-        "Pushing branch '{}' from workspace to remote...",
-        branch_name
-    );
-
-    let output = Command::new("git")
-        .current_dir(&workspace)
-        .args(["push", "-u", "origin", branch_name])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Git push failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "git commit failed: {}",
+            String::from_utf8_lossy(&out.stderr)
         ));
     }
     Ok(())
 }
 
-pub fn reset_to_main() -> Result<(), String> {
-    let workspace = get_workspace();
-    println!("Resetting workspace to main branch...");
+/// Return the unified diff of the current branch against `main`.
+pub fn get_diff_against_main(config: &Config) -> Result<String, String> {
+    let out = run(config, &["diff", "-U2", "main"])?;
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
 
+/// Force-push the branch to `origin` using the tracked remote.
+pub fn push_to_remote(config: &Config, branch_name: &str) -> Result<(), String> {
+    info!(branch = branch_name, "Pushing branch to remote");
+
+    let out = run(config, &["push", "-u", "origin", branch_name])?;
+    if !out.status.success() {
+        return Err(format!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(())
+}
+
+/// Hard-reset and checkout main, then pull latest from origin.
+pub fn reset_to_main(config: &Config) -> Result<(), String> {
+    info!("Resetting workspace to main branch");
+
+    run(config, &["reset", "--hard"])?;
+    run(config, &["checkout", "main"])?;
+
+    let out = run(config, &["pull", "origin", "main"])?;
+    if !out.status.success() {
+        warn!(
+            stderr = %String::from_utf8_lossy(&out.stderr),
+            "git pull returned non-zero — workspace may be stale"
+        );
+    }
+    Ok(())
+}
+
+/// Delete a local branch by name, ignoring errors (best-effort cleanup).
+pub fn delete_local_branch(config: &Config, branch_name: &str) {
+    debug!(branch = branch_name, "Deleting local branch");
+    let _ = run(config, &["branch", "-D", branch_name]);
+}
+
+// ── internal helpers ─────────────────────────────────────────────────────────
+
+fn run(config: &Config, args: &[&str]) -> Result<std::process::Output, String> {
     Command::new("git")
-        .current_dir(&workspace)
-        .args(["reset", "--hard"])
+        .current_dir(&config.workspace_dir)
+        .args(args)
         .output()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Failed to spawn git {:?}: {}", args, e))
+}
 
-    Command::new("git")
-        .current_dir(&workspace)
-        .args(["checkout", "main"])
-        .output()
-        .map_err(|e| e.to_string())?;
-
-    Command::new("git")
-        .current_dir(&workspace)
-        .args(["pull", "origin", "main"])
-        .output()
-        .map_err(|e| e.to_string())?;
-
+pub fn reset_working_tree(config: &Config) -> Result<(), String> {
+    let _ = run(config, &["reset", "--hard", "HEAD"]);
+    let _ = run(config, &["clean", "-fd"]);
     Ok(())
 }
