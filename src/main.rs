@@ -1,4 +1,5 @@
 use dotenv::dotenv;
+use log::info;
 
 mod clients;
 mod helpers;
@@ -12,6 +13,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     dotenv().ok();
+    env_logger::init();
+    info!("Logger initialized");
     println!("========================================");
     println!("BAGENTS: Autonomous Software Factory ");
     println!("========================================\n");
