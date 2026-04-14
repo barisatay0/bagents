@@ -1,5 +1,6 @@
 use dotenv::dotenv;
 use tracing_subscriber::EnvFilter;
+use log::{info, error};
 
 mod clients;
 mod config;
@@ -14,6 +15,9 @@ use prompts::Prompts;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger as early as possible
+    env_logger::init();
+
     // Load .env before anything else so env vars are available for config
     dotenv().ok();
 
@@ -28,19 +32,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TLS provider (must be called before any HTTPS requests)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    println!("========================================");
-    println!("BAGENTS: Autonomous Software Factory");
-    println!("========================================\n");
+    info!("========================================");
+    info!("BAGENTS: Autonomous Software Factory");
+    info!("========================================
+");
 
     // Validate all config and prompt files at startup — fail fast with
     // a clear message rather than panicking mid-run.
     let config = Config::from_env().map_err(|e| {
-        eprintln!("\n{}\n", e);
+        error!("
+{}
+", e);
         e
     })?;
 
     let prompts = Prompts::load().map_err(|e| {
-        eprintln!("\n{}\n", e);
+        error!("
+{}
+", e);
         e
     })?;
 
