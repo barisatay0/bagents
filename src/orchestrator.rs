@@ -51,19 +51,36 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             target_issue.number, target_issue.title
         );
 
-        println!("Reading repository context...");
-        let repo_context = file_system::get_repo_context();
+        println!("Reading repository tree...");
+        let repo_tree = file_system::get_repo_tree();
 
         let team_lead_prompt = fs::read_to_string("config/team_lead.md")?;
         println!("Team Leader is thinking...");
 
-        let team_lead_input = format!("{}  Issue: {}", repo_context, issue_text);
+        let team_lead_input = format!("{}  Issue: {}", repo_tree, issue_text);
         let lead_raw = llm_client::ask(&team_lead_prompt, &team_lead_input).await?;
-        let lead_res: TeamLeaderResponse =
+        let mut lead_res: TeamLeaderResponse =
             serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
+
+        if lead_res.files_to_read.len() > 2 {
+            println!(
+                "WARNING: Team Leader requested {} files. Truncating to 2 to prevent LLM token exhaustion (EOF crash)!",
+                lead_res.files_to_read.len()
+            );
+            lead_res.files_to_read.truncate(2);
+
+            lead_res.architectural_plan = format!(
+                "{} [SYSTEM OVERRIDE: Due to token limits, ONLY modify these specific files in this PR: {:?}. Ignore the rest for now.]",
+                lead_res.architectural_plan, lead_res.files_to_read
+            );
+        }
 
         println!("Agent Assigned: {}", lead_res.assigned_agent);
         println!("Architecture Plan: {}", lead_res.architectural_plan);
+        println!("Files to analyze: {:?}", lead_res.files_to_read);
+
+        let specific_file_contents =
+            file_system::read_specific_files(lead_res.files_to_read.clone());
 
         let dev_prompt_path = format!("config/{}.md", lead_res.assigned_agent);
         let dev_prompt = fs::read_to_string(&dev_prompt_path).unwrap_or_else(|_| {
@@ -78,21 +95,30 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
         let mut attempt = 1;
         let max_attempts = 3;
 
+        // YENİ: Görevin gerçekten bitip bitmediğini takip eden bayrak
+        let mut is_successful = false;
+
         loop {
             println!(" [ATTEMPT {}/{}]", attempt, max_attempts);
             println!(" {} is writing/fixing code...", lead_res.assigned_agent);
 
             let dev_input = if feedback_history.is_empty() {
                 format!(
-                    "Project Context: You are working on the repository '{}/{}'.  {}  Issue: {} Architectural Plan: {}",
-                    repo_owner, repo_name, repo_context, issue_text, lead_res.architectural_plan
+                    "Project Context: '{}/{}'.\n{}\n{}\nIssue: {}\nArchitectural Plan: {}",
+                    repo_owner,
+                    repo_name,
+                    repo_tree,
+                    specific_file_contents,
+                    issue_text,
+                    lead_res.architectural_plan
                 )
             } else {
                 format!(
-                    "Project Context: You are working on the repository '{}/{}'.  {}  Issue: {} Architectural Plan: {}   REVIEWER FEEDBACK TO FIX: {}",
+                    "Project Context: '{}/{}'.\n{}\n{}\nIssue: {}\nArchitectural Plan: {}\nREVIEWER FEEDBACK TO FIX: {}",
                     repo_owner,
                     repo_name,
-                    repo_context,
+                    repo_tree,
+                    specific_file_contents,
                     issue_text,
                     lead_res.architectural_plan,
                     feedback_history
@@ -107,13 +133,12 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                     println!("LLM generated invalid JSON: {}. Forcing retry...", e);
 
                     feedback_history = format!(
-                        "CRITICAL SYSTEM ERROR: Your last response was NOT valid JSON. The parser failed with: '{}'. You MUST strictly follow the JSON formatting rules, properly escape all double quotes (\\\") and newlines (\\n), and ensure the JSON is complete.",
+                        "CRITICAL SYSTEM ERROR: Your last response was NOT valid JSON. Error: '{}'. Strictly follow JSON formatting.",
                         e
                     );
 
                     attempt += 1;
                     if attempt > max_attempts {
-                        println!("🚨 MAX ATTEMPTS REACHED due to JSON parsing errors.");
                         break;
                     }
                     continue;
@@ -121,6 +146,27 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             println!("Dev Thought: {}", dev_res.thought_process);
+
+            let is_lazy = dev_res.files_to_modify.iter().any(|f| {
+                let content = &f.new_content;
+                content.contains("// TODO")
+                    || content.contains("/* TODO")
+                    || content.contains("... existing code ...")
+                    || content.contains("FIXME")
+            });
+
+            if is_lazy {
+                println!(
+                    "❌ SYSTEM REJECT: Agent tried to use placeholders (TODO/...). Forcing retry."
+                );
+                feedback_history = "CRITICAL ERROR: You left placeholders like '// TODO' or '... existing code ...' in the code. You MUST write the COMPLETE, ready-to-run code. Do not skip any logic. Write the ENTIRE file content.".to_string();
+                attempt += 1;
+                if attempt > max_attempts {
+                    println!("🚨 MAX ATTEMPTS REACHED due to Agent Laziness.");
+                    break;
+                }
+                continue;
+            }
 
             git_local::create_branch(&dev_res.branch_name)?;
             file_system::apply_modifications(dev_res.files_to_modify)?;
@@ -131,12 +177,11 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             );
             let _ = git_local::commit_changes(&commit_msg);
 
-            // 4. REVIEWER PHASE
             println!(" Reviewer is analyzing the code...");
             let reviewer_prompt = fs::read_to_string("config/reviewer.md")?;
             let git_diff = git_local::get_diff_against_main().unwrap_or_default();
             let reviewer_input = format!(
-                "Issue being solved: {}  Here is the git diff for the new feature: {}",
+                "Issue being solved: {}\nHere is the git diff for the new feature:\n{}",
                 issue_text, git_diff
             );
 
@@ -151,7 +196,7 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                 println!(" Opening Pull Request on GitHub...");
                 let pr_title = format!("Resolve Issue #{} - Auto AI PR", target_issue.number);
                 let pr_body = format!(
-                    " **Automated PR by AI Software Factory**  **Agent Thought Process:** {}  **Reviewer Notes:** Approved after {} attempts.  Closes #{}",
+                    " **Automated PR by AI Software Factory**\n**Agent Thought Process:** {}\n**Reviewer Notes:** Approved after {} attempts.\nCloses #{}",
                     dev_res.thought_process, attempt, target_issue.number
                 );
 
@@ -161,6 +206,17 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(url) => println!(" BOOM! Pull Request opened successfully: {}", url),
                     Err(e) => println!(" Failed to open PR: {}", e),
                 }
+
+                println!("🧹 Cleaning up workspace and returning to main...");
+                let _ = git_local::reset_to_main();
+
+                let workspace = std::env::var("WORKSPACE_DIR").unwrap_or_default();
+                let _ = std::process::Command::new("git")
+                    .current_dir(&workspace)
+                    .args(["branch", "-D", &dev_res.branch_name])
+                    .output();
+
+                is_successful = true; // YENİ: Başarı durumunu güncelle
                 break;
             } else {
                 println!("❌ REVIEW REJECTED: Changes required.");
@@ -170,7 +226,7 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
                     println!(" Posting Reviewer feedback to GitHub Issue...");
                     let comment_body = format!(
-                        "** Reviewer Feedback (Attempt {}):** {}",
+                        "** Reviewer Feedback (Attempt {}):**\n{}",
                         attempt, feedback_history
                     );
                     let _ = github::create_issue_comment(target_issue.number, &comment_body).await;
@@ -179,16 +235,24 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                 attempt += 1;
                 if attempt > max_attempts {
                     println!(" MAX ATTEMPTS REACHED! Halting feedback loop.");
+                    let _ = git_local::reset_to_main();
                     break;
                 }
             }
         }
 
         processed_issues.insert(target_issue.number);
-        println!(
-            " Workflow completed for Issue #{}. Adding to memory.",
-            target_issue.number
-        );
+        if is_successful {
+            println!(
+                " ✅ Workflow completed successfully for Issue #{}. Adding to memory.",
+                target_issue.number
+            );
+        } else {
+            println!(
+                " ❌ Workflow FAILED for Issue #{}. Agent could not complete the task.",
+                target_issue.number
+            );
+        }
 
         sleep(Duration::from_secs(10)).await;
     }

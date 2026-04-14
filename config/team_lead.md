@@ -10,5 +10,11 @@ EXPECTED JSON OUTPUT FORMAT:
 {
   "thought_process": "Analyzing the issue to determine the scope and required expertise.",
   "assigned_agent": "devops_dev", 
-  "architectural_plan": "Step-by-step instructions for the assigned agent on how to implement this, including file names and logical flow."
+  "architectural_plan": "Step-by-step instructions for the assigned agent on how to implement this, including file names and logical flow.",
+  "files_to_read": [
+    "src/main.rs",
+    "src/orchestrator.rs"
+  ]
 }
+
+CRITICAL: The "files_to_read" field must be an array of strings containing the EXACT file paths from the repository tree that the developer agent needs to read to understand and solve the issue. Do NOT request every file, only the necessary ones to save context window.
