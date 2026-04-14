@@ -1,4 +1,5 @@
 use dotenv::dotenv;
+use log::info;
 
 mod clients;
 mod helpers;
@@ -8,17 +9,17 @@ mod services;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-
+    env_logger::init();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     dotenv().ok();
-    println!("========================================");
-    println!("BAGENTS: Autonomous Software Factory ");
-    println!("========================================\n");
+    info!("========================================");
+    info!("BAGENTS: Autonomous Software Factory ");
+    info!("========================================\n");
 
     // Start the complete autonomous factory workflow
     if let Err(e) = orchestrator::run_factory().await {
-        println!("❌ Factory encountered an error: {}", e);
+        info!("\u{274C} Factory encountered an error: {}", e);
     }
 
     Ok(())
