@@ -1,5 +1,3 @@
-// Helper function to clean markdown code blocks (```json ... ```) that LLMs sometimes stubbornly return
-
 pub fn output(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
@@ -13,6 +11,5 @@ pub fn output(raw: &str) -> String {
         }
     }
 
-    // Fallback
     trimmed.to_string()
 }

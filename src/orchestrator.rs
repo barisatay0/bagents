@@ -45,7 +45,6 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
         let issue_body = target_issue.body.clone().unwrap_or_default();
 
-        // AI'ın kendi notlarını okuması için yorumları çek
         let comments_history = github::fetch_issue_comments(target_issue.number)
             .await
             .unwrap_or_default();
@@ -71,7 +70,6 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
         let mut lead_res: TeamLeaderResponse =
             serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
 
-        // --- YORUM (COMMENT) TABANLI AUTO-CONTINUE MANTIĞI ---
         let mut was_truncated = false;
         let mut remaining_files = Vec::new();
 
@@ -143,7 +141,6 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
 
             println!("Dev Thought: {}", dev_res.thought_process);
 
-            // Laziness Check
             if dev_res.files_to_modify.iter().any(|f| {
                 f.new_content.contains("// TODO")
                     || f.new_content.contains("... existing code ...")
@@ -231,10 +228,8 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // --- İŞ BİTİRME VEYA YARIM BIRAKMA MANTIĞI ---
         if is_successful {
             if was_truncated {
-                // Görev yarım kaldıysa, issue'ya not düş ve processed listesine EKLEME!
                 let comment = format!(
                     "**[AUTO-CONTINUE] Partial Completion** 🔄\nI have successfully updated these files in the latest PR: `{:?}`.\n\nDue to cognitive token limits, I still need to process the following files: `{:?}`.\n\n*I will pick this up in the next cycle automatically.*",
                     lead_res.files_to_read, remaining_files
@@ -245,7 +240,6 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                     target_issue.number
                 );
             } else {
-                // Görev tamamen bittiyse listeye ekle, bir daha bakmasın.
                 processed_issues.insert(target_issue.number);
                 println!(
                     " ✅ Workflow fully completed for Issue #{}. Adding to memory.",
@@ -253,7 +247,6 @@ pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         } else {
-            // Başarısız olduysa takılıp kalmasın diye listeye ekliyoruz
             processed_issues.insert(target_issue.number);
             println!(
                 " ❌ Workflow FAILED for Issue #{}. Agent could not complete the task.",

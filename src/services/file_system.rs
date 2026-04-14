@@ -10,16 +10,12 @@ pub fn apply_modifications(modifications: Vec<FileModification>) -> Result<(), S
     for modif in modifications {
         let full_path = workspace_path.join(&modif.file_path);
 
-        // Create directories if they don't exist
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        // --- SMARTER CLEANUP ---
         let mut final_content = modif.new_content;
 
-        // Check if the LLM returned a completely flattened string (the over-escaping bug)
-        // If there are zero actual newlines, but plenty of literal "\n", it's over-escaped.
         if !final_content.contains('\n') && final_content.contains("\\n") {
             println!(
                 "🛠️ Detected flattened LLM output. Expanding literal '\\n' into real newlines."

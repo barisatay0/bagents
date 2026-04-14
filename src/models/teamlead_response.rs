@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 
-// Response format for the Team Leader agent
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TeamLeaderResponse {
     pub thought_process: String,
