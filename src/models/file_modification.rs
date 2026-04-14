@@ -1,8 +1,16 @@
 use serde::{Deserialize, Serialize};
 
-// Structure that holds the files to be modified by developer agents
-#[derive(Debug, Serialize, Deserialize)]
+/// A single file to be written (created or overwritten) by a developer agent.
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct FileModification {
+    /// Relative path inside the workspace (e.g. `src/lib.rs`).
     pub file_path: String,
+    #[serde(default)]
     pub new_content: String,
+    #[serde(default)]
+    pub search_block: String,
+    #[serde(default)]
+    pub replace_block: String,
+    #[serde(default)]
+    pub target_chunk: String,
 }
