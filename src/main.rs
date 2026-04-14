@@ -1,5 +1,4 @@
 use dotenv::dotenv;
-use tracing_subscriber::EnvFilter;
 use log::{info, error};
 
 mod clients;
@@ -18,19 +17,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env before anything else so env vars are available for config
     dotenv().ok();
 
-    // Initialize the logger (env_logger) before any logging occurs
+    // Initialize logger (env_logger) – control verbosity with RUST_LOG env var.
+    // e.g. RUST_LOG=bagents=debug or RUST_LOG=info
     env_logger::init();
-
-    // Structured logging — control verbosity with RUST_LOG env var.
-    // e.g. RUST_LOG=bagents=debug  or  RUST_LOG=info
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
-        .init();
-
-    // TLS provider (must be called before any HTTPS requests)
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     info!("========================================");
     info!("BAGENTS: Autonomous Software Factory");
@@ -53,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         e
     })?;
 
-    tracing::info!(
+    info!(
         owner = %config.github_owner,
         repo = %config.github_repo,
         workspace = %config.workspace_dir.display(),
@@ -62,7 +51,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     if let Err(e) = orchestrator::run_factory(&config, &prompts).await {
-        tracing::error!(err = %e, "Factory encountered a fatal error");
+        error!(err = %e, "Factory encountered a fatal error");
     }
 
     Ok(())
