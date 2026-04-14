@@ -1,6 +1,6 @@
 use dotenv::dotenv;
 use tracing_subscriber::EnvFilter;
-use log::{info, debug, warn, error};
+use log::{info, error};
 
 mod clients;
 mod config;
@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env before anything else so env vars are available for config
     dotenv().ok();
 
-    // Initialize logger
+    // Initialize the logger (env_logger) before any logging occurs
     env_logger::init();
 
     // Structured logging — control verbosity with RUST_LOG env var.
