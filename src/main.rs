@@ -1,5 +1,6 @@
 use dotenv::dotenv;
 use tracing_subscriber::EnvFilter;
+use env_logger;
 use log::{info, error};
 
 mod clients;
@@ -28,9 +29,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
-
-    // TLS provider (must be called before any HTTPS requests)
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     info!("========================================");
     info!("BAGENTS: Autonomous Software Factory");
