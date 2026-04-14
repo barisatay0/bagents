@@ -1,6 +1,5 @@
 use dotenv::dotenv;
 use tracing_subscriber::EnvFilter;
-use env_logger;
 use log::{info, error};
 
 mod clients;
@@ -19,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env before anything else so env vars are available for config
     dotenv().ok();
 
-    // Initialize the logger (env_logger) as early as possible.
+    // Initialize logger (env_logger reads RUST_LOG env var)
     env_logger::init();
 
     // Structured logging — control verbosity with RUST_LOG env var.
@@ -33,14 +32,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // TLS provider (must be called before any HTTPS requests)
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    // Banner output using the logging system instead of println!
     info!("========================================
-");
-    info!("BAGENTS: Autonomous Software Factory
-");
-    info!("========================================
-");
-    info!("
+BAGENTS: Autonomous Software Factory
+========================================
 ");
 
     // Validate all config and prompt files at startup — fail fast with
