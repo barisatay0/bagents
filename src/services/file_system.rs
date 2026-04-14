@@ -15,20 +15,33 @@ pub fn apply_modifications(modifications: Vec<FileModification>) -> Result<(), S
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
         }
 
-        // Write the new content to the file in the target workspace
-        fs::write(&full_path, modif.new_content).map_err(|e| e.to_string())?;
+        // --- SMARTER CLEANUP ---
+        let mut final_content = modif.new_content;
+
+        // Check if the LLM returned a completely flattened string (the over-escaping bug)
+        // If there are zero actual newlines, but plenty of literal "\n", it's over-escaped.
+        if !final_content.contains('\n') && final_content.contains("\\n") {
+            println!(
+                "🛠️ Detected flattened LLM output. Expanding literal '\\n' into real newlines."
+            );
+            final_content = final_content.replace("\\n", "\n");
+            final_content = final_content.replace("\\t", "\t");
+            final_content = final_content.replace("\\\"", "\"");
+        }
+
+        fs::write(&full_path, final_content).map_err(|e| e.to_string())?;
         println!("File updated/created in target repo: {:?}", full_path);
     }
     Ok(())
 }
 
-pub fn get_repo_context() -> String {
+pub fn get_repo_tree() -> String {
     let workspace_str = std::env::var("WORKSPACE_DIR").expect("WORKSPACE_DIR missing in .env");
     let workspace_path = std::path::Path::new(&workspace_str);
 
-    let mut context = String::from("REPOSITORY STRUCTURE (DIRECTORY TREE):");
-
+    let mut context = String::from("REPOSITORY STRUCTURE (DIRECTORY TREE):\n");
     let mut file_paths = Vec::new();
+
     fn collect_paths(dir: &std::path::Path, workspace: &std::path::Path, paths: &mut Vec<String>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
@@ -61,30 +74,36 @@ pub fn get_repo_context() -> String {
     file_paths.sort();
 
     for path in &file_paths {
-        context.push_str(&format!("  - {} ", path));
-    }
-
-    context.push_str(" EXISTING FILE CONTENTS (FOR CONTEXT & STYLE MATCHING):  ");
-
-    for path_str in file_paths {
-        let full_path = workspace_path.join(&path_str);
-        if let Ok(content) = std::fs::read_to_string(&full_path) {
-            if path_str.ends_with(".lock")
-                || path_str.ends_with(".png")
-                || path_str.ends_with(".jpg")
-            {
-                continue;
-            }
-            if content.len() > 15000 {
-                context.push_str(&format!(
-                    "--- FILE: {} (Content too large, skipped) ---",
-                    path_str
-                ));
-            } else {
-                context.push_str(&format!("--- FILE: {} --- {}  ", path_str, content));
-            }
-        }
+        context.push_str(&format!("  - {}\n", path));
     }
 
     context
+}
+
+pub fn read_specific_files(files: Vec<String>) -> String {
+    let workspace_str = std::env::var("WORKSPACE_DIR").expect("WORKSPACE_DIR missing in .env");
+    let workspace_path = std::path::Path::new(&workspace_str);
+
+    let mut contents = String::from("REQUESTED FILE CONTENTS:\n");
+
+    for file_path in files {
+        let full_path = workspace_path.join(&file_path);
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            if content.len() > 15000 {
+                contents.push_str(&format!(
+                    "\n--- FILE: {} (Content too large, skipped) ---\n",
+                    file_path
+                ));
+            } else {
+                contents.push_str(&format!("\n--- FILE: {} ---\n{}\n", file_path, content));
+            }
+        } else {
+            contents.push_str(&format!(
+                "\n--- FILE: {} (Could not read file or file does not exist) ---\n",
+                file_path
+            ));
+        }
+    }
+
+    contents
 }
