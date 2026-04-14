@@ -1,7 +1,6 @@
 use dotenv::dotenv;
 use tracing_subscriber::EnvFilter;
-use env_logger;
-use log::{info, error};
+use log::{info, debug, warn, error};
 
 mod clients;
 mod config;
@@ -16,11 +15,11 @@ use prompts::Prompts;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logger as early as possible
-    env_logger::init();
-
     // Load .env before anything else so env vars are available for config
     dotenv().ok();
+
+    // Initialize logger
+    env_logger::init();
 
     // Structured logging — control verbosity with RUST_LOG env var.
     // e.g. RUST_LOG=bagents=debug  or  RUST_LOG=info
@@ -29,6 +28,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
+
+    // TLS provider (must be called before any HTTPS requests)
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     info!("========================================");
     info!("BAGENTS: Autonomous Software Factory");
