@@ -1,88 +1,98 @@
 use octocrab::{Octocrab, models::issues::Issue};
-use std::env;
+use tracing::{debug, info};
 
-pub async fn fetch_open_issues() -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN missing in .env");
-    let owner = env::var("GITHUB_OWNER").expect("GITHUB_OWNER missing in .env");
-    let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO missing in .env");
+use crate::config::Config;
 
-    let octocrab = Octocrab::builder().personal_token(token).build()?;
+/// Build an authenticated Octocrab client from config.
+fn build_client(config: &Config) -> Result<Octocrab, Box<dyn std::error::Error>> {
+    Ok(Octocrab::builder()
+        .personal_token(config.github_token.clone())
+        .build()?)
+}
 
-    let issues_page = octocrab
-        .issues(owner, repo)
+/// Fetch all open issues for the configured repository, excluding pull requests.
+pub async fn fetch_open_issues(config: &Config) -> Result<Vec<Issue>, Box<dyn std::error::Error>> {
+    let client = build_client(config)?;
+
+    let page = client
+        .issues(&config.github_owner, &config.github_repo)
         .list()
         .state(octocrab::params::State::Open)
         .send()
         .await?;
 
-    let actual_issues: Vec<Issue> = issues_page
+    let issues: Vec<Issue> = page
         .items
         .into_iter()
-        .filter(|issue| issue.pull_request.is_none())
+        .filter(|i| i.pull_request.is_none())
         .collect();
 
-    Ok(actual_issues)
+    debug!(count = issues.len(), "Fetched open issues");
+    Ok(issues)
 }
 
+/// Open a pull request from `head_branch` into `base_branch`.
+/// Returns the HTML URL of the created PR.
 pub async fn create_pull_request(
+    config: &Config,
     title: &str,
     body: &str,
     head_branch: &str,
     base_branch: &str,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN missing in .env");
-    let owner = env::var("GITHUB_OWNER").expect("GITHUB_OWNER missing in .env");
-    let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO missing in .env");
+    let client = build_client(config)?;
 
-    let octocrab = Octocrab::builder().personal_token(token).build()?;
-
-    let pr = octocrab
-        .pulls(owner, repo)
+    let pr = client
+        .pulls(&config.github_owner, &config.github_repo)
         .create(title, head_branch, base_branch)
         .body(body)
         .send()
         .await?;
 
-    Ok(pr.html_url.map(|url| url.to_string()).unwrap_or_default())
+    let url = pr.html_url.map(|u| u.to_string()).unwrap_or_default();
+    info!(url = %url, "Pull request created");
+    Ok(url)
 }
 
+/// Post a comment on the given issue number.
 pub async fn create_issue_comment(
+    config: &Config,
     issue_number: u64,
     body: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN missing in .env");
-    let owner = env::var("GITHUB_OWNER").expect("GITHUB_OWNER missing in .env");
-    let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO missing in .env");
+    let client = build_client(config)?;
 
-    let octocrab = Octocrab::builder().personal_token(token).build()?;
-
-    octocrab
-        .issues(owner, repo)
+    client
+        .issues(&config.github_owner, &config.github_repo)
         .create_comment(issue_number, body)
         .await?;
 
+    debug!(issue = issue_number, "Comment posted");
     Ok(())
 }
 
-pub async fn fetch_issue_comments(issue_number: u64) -> Result<String, Box<dyn std::error::Error>> {
-    let token = env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN missing in .env");
-    let owner = env::var("GITHUB_OWNER").expect("GITHUB_OWNER missing in .env");
-    let repo = env::var("GITHUB_REPO").expect("GITHUB_REPO missing in .env");
+/// Fetch all comments on an issue and concatenate them into a single string.
+pub async fn fetch_issue_comments(
+    config: &Config,
+    issue_number: u64,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let client = build_client(config)?;
 
-    let octocrab = Octocrab::builder().personal_token(token).build()?;
-
-    let comments = octocrab
-        .issues(owner, repo)
+    let comments = client
+        .issues(&config.github_owner, &config.github_repo)
         .list_comments(issue_number)
         .send()
         .await?;
 
-    let mut all_comments = String::new();
-    for c in comments {
-        if let Some(body) = c.body {
-            all_comments.push_str(&format!("Comment by {}:\n{}\n\n", c.user.login, body));
-        }
-    }
+    let combined = comments
+        .items
+        .iter()
+        .filter_map(|c| {
+            c.body
+                .as_deref()
+                .map(|b| format!("Comment by {}:\n{}\n\n", c.user.login, b))
+        })
+        .collect::<String>();
 
-    Ok(all_comments)
+    Ok(combined)
 }
