@@ -1,266 +1,497 @@
+use std::collections::HashSet;
+use tokio::time::{Duration, sleep};
+use tracing::{error, info, warn};
+
 use crate::clients::llm_client;
+use crate::config::Config;
 use crate::models::{
     developer_response::DeveloperResponse, reviewer_response::ReviewerResponse,
     teamlead_response::TeamLeaderResponse,
 };
+use crate::prompts::Prompts;
 use crate::services::{file_system, git_local, github};
-use std::collections::HashSet;
-use std::fs;
-use tokio::time::{Duration, sleep};
 
-pub async fn run_factory() -> Result<(), Box<dyn std::error::Error>> {
-    println!("Factory started! Waiting for issues in continuous mode...");
+/// Placeholder markers that indicate an agent submitted incomplete code.
+const PLACEHOLDER_MARKERS: &[&str] = &[
+    "// TODO",
+    "// FIXME",
+    "// HACK",
+    "// XXX",
+    "todo!()",
+    "unimplemented!()",
+    "... existing code ...",
+    "/* TODO */",
+    "# TODO",
+    "FIXME",
+];
+
+/// Maximum number of files passed to a developer agent per cycle.
+/// Keeping this at 1 protects the context window. Increase as models improve.
+const MAX_FILES_PER_CYCLE: usize = 1;
+
+// ── entry point ──────────────────────────────────────────────────────────────
+
+/// Main factory loop. Polls GitHub for open issues, orchestrates agents,
+/// reviews code, and opens pull requests until interrupted.
+pub async fn run_factory(
+    config: &Config,
+    prompts: &Prompts,
+) -> Result<(), Box<dyn std::error::Error>> {
+    info!("Factory started — polling for issues continuously");
 
     let mut processed_issues: HashSet<u64> = HashSet::new();
 
     loop {
-        println!("Checking GitHub for open issues...");
-        let issues = match github::fetch_open_issues().await {
+        info!("Checking GitHub for open issues...");
+
+        let issues = match github::fetch_open_issues(config).await {
             Ok(i) => i,
             Err(e) => {
-                println!("GitHub API Error: {}. Retrying later...", e);
+                error!(err = %e, "GitHub API error — retrying in 60s");
                 sleep(Duration::from_secs(60)).await;
                 continue;
             }
         };
 
-        let mut target_issue = None;
-        for issue in issues {
-            if !processed_issues.contains(&issue.number) {
-                target_issue = Some(issue);
-                break;
-            }
-        }
-
-        let target_issue = match target_issue {
-            Some(issue) => issue,
+        let target_issue = match issues
+            .into_iter()
+            .find(|i| !processed_issues.contains(&i.number))
+        {
+            Some(i) => i,
             None => {
-                println!(" No new open issues found. Factory is resting for 30 seconds...");
+                info!("No new issues — resting for 30s");
                 sleep(Duration::from_secs(30)).await;
                 continue;
             }
         };
 
-        let _ = git_local::reset_to_main();
-
-        let issue_body = target_issue.body.clone().unwrap_or_default();
-
-        // AI'ın kendi notlarını okuması için yorumları çek
-        let comments_history = github::fetch_issue_comments(target_issue.number)
-            .await
-            .unwrap_or_default();
-
-        let issue_text = format!(
-            "Title: {}\nBody: {}\n\n--- COMMENTS HISTORY ---\n{}",
-            target_issue.title, issue_body, comments_history
+        info!(
+            issue = target_issue.number,
+            title = %target_issue.title,
+            "Processing issue"
         );
 
-        println!(
-            " ======================================== Processing Issue #{}: {} ========================================",
-            target_issue.number, target_issue.title
-        );
-
-        println!("Reading repository tree...");
-        let repo_tree = file_system::get_repo_tree();
-
-        let team_lead_prompt = fs::read_to_string("config/team_lead.md")?;
-        let team_lead_input = format!("{}  Issue Context: {}", repo_tree, issue_text);
-
-        println!("Team Leader is thinking...");
-        let lead_raw = llm_client::ask(&team_lead_prompt, &team_lead_input).await?;
-        let mut lead_res: TeamLeaderResponse =
-            serde_json::from_str(&lead_raw).expect("Failed to parse Team Leader JSON");
-
-        // --- YORUM (COMMENT) TABANLI AUTO-CONTINUE MANTIĞI ---
-        let mut was_truncated = false;
-        let mut remaining_files = Vec::new();
-
-        if lead_res.files_to_read.len() > 1 {
-            was_truncated = true;
-            remaining_files = lead_res.files_to_read.split_off(1); // İlk 1'i tut, kalanları ayır
-
-            println!(
-                "⚠️ Token protection active! Retained 1 files. Remaining {} files saved for next cycle.",
-                remaining_files.len()
-            );
-
-            lead_res.architectural_plan = format!(
-                "{} [SYSTEM OVERRIDE: Due to token limits, ONLY modify these specific files in this PR: {:?}. Ignore the rest for now.]",
-                lead_res.architectural_plan, lead_res.files_to_read
-            );
+        // Always start from a clean main branch
+        if let Err(e) = git_local::reset_to_main(config) {
+            error!(err = %e, "Could not reset to main — skipping issue");
+            sleep(Duration::from_secs(10)).await;
+            continue;
         }
 
-        println!("Agent Assigned: {}", lead_res.assigned_agent);
-        println!("Architecture Plan: {}", lead_res.architectural_plan);
-        println!("Files to analyze: {:?}", lead_res.files_to_read);
+        let is_successful = process_issue(config, prompts, &target_issue).await;
 
-        let specific_file_contents =
-            file_system::read_specific_files(lead_res.files_to_read.clone());
-        let dev_prompt = fs::read_to_string(format!("config/{}.md", lead_res.assigned_agent))
-            .unwrap_or_else(|_| fs::read_to_string("config/backend_dev.md").unwrap());
-
-        let repo_owner = std::env::var("GITHUB_OWNER").unwrap_or_default();
-        let repo_name = std::env::var("GITHUB_REPO").unwrap_or_default();
-
-        let mut feedback_history = String::new();
-        let mut attempt = 1;
-        let max_attempts = 3;
-        let mut is_successful = false;
-
-        loop {
-            println!(
-                " [ATTEMPT {}/{}] {} is writing/fixing code...",
-                attempt, max_attempts, lead_res.assigned_agent
-            );
-
-            let dev_input = format!(
-                "Project Context: '{}/{}'.\n{}\n{}\nIssue: {}\nArchitectural Plan: {}\nREVIEWER FEEDBACK TO FIX: {}",
-                repo_owner,
-                repo_name,
-                repo_tree,
-                specific_file_contents,
-                issue_text,
-                lead_res.architectural_plan,
-                feedback_history
-            );
-
-            let dev_raw = llm_client::ask(&dev_prompt, &dev_input).await?;
-            let dev_res: DeveloperResponse = match serde_json::from_str(&dev_raw) {
-                Ok(res) => res,
-                Err(e) => {
-                    println!("LLM generated invalid JSON: {}. Forcing retry...", e);
-                    feedback_history = format!(
-                        "CRITICAL SYSTEM ERROR: Your last response was NOT valid JSON. Error: '{}'. Strictly follow JSON formatting.",
-                        e
-                    );
-                    attempt += 1;
-                    if attempt > max_attempts {
-                        break;
-                    }
-                    continue;
-                }
-            };
-
-            println!("Dev Thought: {}", dev_res.thought_process);
-
-            // Laziness Check
-            if dev_res.files_to_modify.iter().any(|f| {
-                f.new_content.contains("// TODO")
-                    || f.new_content.contains("... existing code ...")
-                    || f.new_content.contains("FIXME")
-            }) {
-                println!(
-                    "❌ SYSTEM REJECT: Agent tried to use placeholders (TODO/...). Forcing retry."
-                );
-                feedback_history = "CRITICAL ERROR: You left placeholders like '// TODO' or '... existing code ...' in the code. You MUST write the COMPLETE, ready-to-run code. Do not skip any logic. Write the ENTIRE file content.".to_string();
-                attempt += 1;
-                if attempt > max_attempts {
-                    println!("🚨 MAX ATTEMPTS REACHED due to Agent Laziness.");
-                    break;
-                }
-                continue;
-            }
-
-            git_local::create_branch(&dev_res.branch_name)?;
-            file_system::apply_modifications(dev_res.files_to_modify)?;
-
-            let commit_msg = format!(
-                "feat: Resolve issue #{} (Attempt {})",
-                target_issue.number, attempt
-            );
-            let _ = git_local::commit_changes(&commit_msg);
-
-            println!(" Reviewer is analyzing the code...");
-            let reviewer_prompt = fs::read_to_string("config/reviewer.md")?;
-            let git_diff = git_local::get_diff_against_main().unwrap_or_default();
-
-            let reviewer_input = format!(
-                "Original Issue: {}\nArchitectural Plan (Scope): {}\nDiff:\n{}",
-                issue_text, lead_res.architectural_plan, git_diff
-            );
-
-            let rev_raw = llm_client::ask(&reviewer_prompt, &reviewer_input).await?;
-            let rev_res: ReviewerResponse =
-                serde_json::from_str(&rev_raw).expect("Rev JSON Failed");
-
-            if rev_res.is_approved {
-                println!(" REVIEW APPROVED: Code is clean and production-ready!");
-                let _ = git_local::push_to_remote(&dev_res.branch_name);
-
-                println!(" Opening Pull Request on GitHub...");
-                let pr_title = format!("Resolve Issue #{} - Auto AI PR", target_issue.number);
-                let pr_body = format!(
-                    " **Automated PR by AI Software Factory**\n**Agent Thought Process:** {}\nCloses #{}",
-                    dev_res.thought_process, target_issue.number
-                );
-
-                match github::create_pull_request(&pr_title, &pr_body, &dev_res.branch_name, "main")
-                    .await
-                {
-                    Ok(url) => println!(" BOOM! Pull Request opened successfully: {}", url),
-                    Err(e) => println!(" Failed to open PR: {}", e),
-                }
-
-                println!("🧹 Cleaning up workspace and returning to main...");
-                let _ = git_local::reset_to_main();
-                let workspace = std::env::var("WORKSPACE_DIR").unwrap_or_default();
-                let _ = std::process::Command::new("git")
-                    .current_dir(&workspace)
-                    .args(["branch", "-D", &dev_res.branch_name])
-                    .output();
-
-                is_successful = true;
-                break;
-            } else {
-                println!("❌ REVIEW REJECTED: Changes required.");
-                feedback_history = rev_res.feedback_thread.unwrap_or_default();
-                println!(" Feedback: {}", feedback_history);
-
-                let comment_body = format!(
-                    "** Reviewer Feedback (Attempt {}):**\n{}",
-                    attempt, feedback_history
-                );
-                let _ = github::create_issue_comment(target_issue.number, &comment_body).await;
-
-                attempt += 1;
-                if attempt > max_attempts {
-                    println!(" MAX ATTEMPTS REACHED! Halting feedback loop.");
-                    let _ = git_local::reset_to_main();
-                    break;
-                }
-            }
-        }
-
-        // --- İŞ BİTİRME VEYA YARIM BIRAKMA MANTIĞI ---
         if is_successful {
-            if was_truncated {
-                // Görev yarım kaldıysa, issue'ya not düş ve processed listesine EKLEME!
-                let comment = format!(
-                    "**[AUTO-CONTINUE] Partial Completion** 🔄\nI have successfully updated these files in the latest PR: `{:?}`.\n\nDue to cognitive token limits, I still need to process the following files: `{:?}`.\n\n*I will pick this up in the next cycle automatically.*",
-                    lead_res.files_to_read, remaining_files
-                );
-                let _ = github::create_issue_comment(target_issue.number, &comment).await;
-                println!(
-                    " ⏳ Issue #{} partially completed. Auto-continue comment added.",
-                    target_issue.number
-                );
-            } else {
-                // Görev tamamen bittiyse listeye ekle, bir daha bakmasın.
-                processed_issues.insert(target_issue.number);
-                println!(
-                    " ✅ Workflow fully completed for Issue #{}. Adding to memory.",
-                    target_issue.number
-                );
-            }
-        } else {
-            // Başarısız olduysa takılıp kalmasın diye listeye ekliyoruz
+            info!(issue = target_issue.number, "Issue completed successfully");
             processed_issues.insert(target_issue.number);
-            println!(
-                " ❌ Workflow FAILED for Issue #{}. Agent could not complete the task.",
-                target_issue.number
+        } else {
+            warn!(
+                issue = target_issue.number,
+                "Issue failed, exhausted, or deferred"
             );
         }
 
         sleep(Duration::from_secs(10)).await;
     }
+}
+
+// ── stage 1: plan ─────────────────────────────────────────────────────────────
+
+/// Ask the team lead to analyse the issue and produce an architectural plan.
+/// Returns `None` if the LLM returns unparseable JSON after logging the error.
+async fn plan_issue(
+    config: &Config,
+    prompts: &Prompts,
+    issue_text: &str,
+    repo_tree: &str,
+) -> Option<TeamLeaderResponse> {
+    info!("Team leader is planning...");
+
+    let input = format!("{}  Issue Context: {}", repo_tree, issue_text);
+
+    let raw = match llm_client::ask(config, &prompts.team_lead, &input).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(err = %e, "LLM request failed during planning");
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<TeamLeaderResponse>(&raw) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            error!(err = %e, raw = %raw, "Team lead returned invalid JSON");
+            None
+        }
+    }
+}
+
+// ── stage 2: token budget ─────────────────────────────────────────────────────
+
+struct TokenBudgetResult {
+    lead_res: TeamLeaderResponse,
+    remaining_files: Vec<String>,
+    was_truncated: bool,
+}
+
+/// Enforce the per-cycle file limit. Injects a SYSTEM OVERRIDE into the
+/// architectural plan and records the spilled files for the AUTO-CONTINUE comment.
+fn apply_token_budget(mut lead_res: TeamLeaderResponse) -> TokenBudgetResult {
+    if lead_res.files_to_read.len() <= MAX_FILES_PER_CYCLE {
+        return TokenBudgetResult {
+            lead_res,
+            remaining_files: Vec::new(),
+            was_truncated: false,
+        };
+    }
+
+    let remaining_files = lead_res.files_to_read.split_off(MAX_FILES_PER_CYCLE);
+
+    warn!(
+        retained = lead_res.files_to_read.len(),
+        deferred = remaining_files.len(),
+        "Token budget active — deferring files to next cycle"
+    );
+
+    lead_res.architectural_plan = format!(
+        "{} [SYSTEM OVERRIDE: Due to token limits, ONLY modify these specific files in this PR: {:?}. Ignore the rest for now.]",
+        lead_res.architectural_plan, lead_res.files_to_read
+    );
+
+    TokenBudgetResult {
+        lead_res,
+        remaining_files,
+        was_truncated: true,
+    }
+}
+
+// ── stage 3: dev loop ─────────────────────────────────────────────────────────
+
+struct DevLoopResult {
+    success: bool,
+    branch_name: String,
+    thought_process: String,
+}
+
+/// Run the developer → commit → review feedback loop for up to `max_attempts`.
+///
+/// On each attempt the workspace is reset to main first to ensure the developer
+/// always works from a clean baseline rather than layering on previous attempts.
+async fn execute_dev_loop(
+    config: &Config,
+    prompts: &Prompts,
+    issue_text: &str,
+    repo_tree: &str,
+    lead_res: &TeamLeaderResponse,
+    branch_name: &str,
+) -> DevLoopResult {
+    let max_attempts = 3;
+    let mut feedback_history = String::new();
+
+    let specific_files = if lead_res.chunks_to_read.is_empty() {
+        file_system::read_specific_files(config, lead_res.files_to_read.clone())
+    } else {
+        let mut chunks_output = String::new();
+        for file in &lead_res.files_to_read {
+            chunks_output.push_str(&file_system::read_specific_chunks(
+                config,
+                file,
+                lead_res.chunks_to_read.clone(),
+            ));
+        }
+        chunks_output
+    };
+
+    let semantic_outlines =
+        file_system::read_semantic_outlines(config, lead_res.files_to_read.clone());
+
+    for attempt in 1..=max_attempts {
+        info!(attempt, max_attempts, agent = %lead_res.assigned_agent, "Developer writing code");
+
+        // Reset uncommitted changes instead of hard resetting to main.
+        // This ensures we stay on the current issue branch but wipe bad LLM code from previous attempts.
+        if let Err(e) = git_local::reset_working_tree(config) {
+            error!(err = %e, "Could not reset working tree before attempt");
+            break;
+        }
+
+        let dev_input = format!(
+            "Project Context: '{}/{}'.\n{}\n{}\n{}\nIssue: {}\nArchitectural Plan: {}\nREVIEWER FEEDBACK TO FIX: {}",
+            config.github_owner,
+            config.github_repo,
+            repo_tree,
+            semantic_outlines,
+            specific_files,
+            issue_text,
+            lead_res.architectural_plan,
+            feedback_history
+        );
+
+        let dev_prompt = prompts.for_agent(&lead_res.assigned_agent);
+
+        let raw = match llm_client::ask(config, dev_prompt, &dev_input).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!(err = %e, "LLM request failed during dev loop");
+                feedback_history = format!("SYSTEM ERROR: LLM request failed: {}", e);
+                continue;
+            }
+        };
+
+        let dev_res: DeveloperResponse = match serde_json::from_str(&raw) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(err = %e, "Developer returned invalid JSON — retrying");
+                let snippet = raw.chars().take(300).collect::<String>();
+                feedback_history = format!(
+                    "CRITICAL: Your last response was NOT valid JSON. serde error: '{}'. \
+                     The response started with: {:?}. \
+                     Output ONLY a raw JSON object. No thinking text, no markdown, no prose before or after the {{}}.",
+                    e, snippet
+                );
+                continue;
+            }
+        };
+
+        info!(thought = %dev_res.thought_process, "Developer response parsed");
+
+        // Placeholder check — report which file triggered it
+        if let Some(bad_file) = find_placeholder(&dev_res) {
+            warn!(file = %bad_file, "Placeholder detected — rejecting");
+            feedback_history = format!(
+                "CRITICAL ERROR: File '{}' contains placeholder code (TODO/FIXME/unimplemented!/etc.). \
+                 Write the COMPLETE, production-ready implementation. Do not skip any logic.",
+                bad_file
+            );
+            continue;
+        }
+
+        // Apply changes and commit
+        if let Err(e) = file_system::apply_modifications(config, dev_res.files_to_modify) {
+            warn!(err = %e, "Patch failed");
+            feedback_history = format!(
+                "CRITICAL ERROR: Failed to apply patch. The search_block did NOT match the file exactly. \
+                 Remember to include exact line breaks and spaces. Error: {}",
+                e
+            );
+            continue;
+        }
+
+        let commit_msg = format!("feat: Resolve issue (attempt {})", attempt);
+        let _ = git_local::commit_changes(config, &commit_msg);
+
+        // Review
+        match review_code(config, prompts, issue_text, &lead_res.architectural_plan).await {
+            Some(rev) if rev.is_approved => {
+                info!("Review approved");
+                return DevLoopResult {
+                    success: true,
+                    branch_name: branch_name.to_string(),
+                    thought_process: dev_res.thought_process,
+                };
+            }
+            Some(rev) => {
+                feedback_history = rev.feedback_thread.unwrap_or_default();
+                warn!(feedback = %feedback_history, attempt, "Review rejected");
+            }
+            None => {
+                warn!(
+                    attempt,
+                    "Reviewer returned unparseable JSON — treating as rejection"
+                );
+                feedback_history =
+                    "The reviewer could not parse its own output. Please ensure your code is complete and correct.".to_string();
+            }
+        }
+    }
+
+    warn!("Max attempts reached without approval");
+    DevLoopResult {
+        success: false,
+        branch_name: String::new(),
+        thought_process: String::new(),
+    }
+}
+
+// ── stage 4: review ───────────────────────────────────────────────────────────
+
+/// Ask the reviewer to evaluate the current diff. Returns `None` on parse error.
+async fn review_code(
+    config: &Config,
+    prompts: &Prompts,
+    issue_text: &str,
+    architectural_plan: &str,
+) -> Option<ReviewerResponse> {
+    info!("Reviewer analysing code...");
+
+    let diff = git_local::get_diff_against_main(config).unwrap_or_default();
+    let input = format!(
+        "Original Issue: {}\nArchitectural Plan (Scope): {}\nDiff:\n{}",
+        issue_text, architectural_plan, diff
+    );
+
+    let raw = match llm_client::ask(config, &prompts.reviewer, &input).await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(err = %e, "LLM request failed during review");
+            return None;
+        }
+    };
+
+    match serde_json::from_str::<ReviewerResponse>(&raw) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            error!(err = %e, raw = %raw, "Reviewer returned invalid JSON");
+            None
+        }
+    }
+}
+
+// ── stage 5: deliver ──────────────────────────────────────────────────────────
+
+/// Push the approved branch and open a pull request. Returns the PR URL.
+async fn deliver_pr(
+    config: &Config,
+    issue_number: u64,
+    branch_name: &str,
+    thought_process: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    git_local::push_to_remote(config, branch_name)?;
+
+    let title = format!("Resolve Issue #{} — Auto AI PR", issue_number);
+    let body = format!(
+        "**Automated PR by AI Software Factory**\n\n**Agent thought process:** {}\n\nCloses #{}",
+        thought_process, issue_number
+    );
+
+    github::create_pull_request(config, &title, &body, branch_name, "main").await
+}
+
+// ── top-level per-issue workflow ──────────────────────────────────────────────
+
+/// Full workflow for a single issue. Returns `true` if a PR was opened.
+async fn process_issue(
+    config: &Config,
+    prompts: &Prompts,
+    issue: &octocrab::models::issues::Issue,
+) -> bool {
+    let branch_name = format!("feature/issue-{}", issue.number);
+
+    if let Err(e) = git_local::create_branch(config, &branch_name) {
+        error!(err = %e, "Could not setup branch for issue");
+        return false;
+    }
+
+    let issue_body = issue.body.clone().unwrap_or_default();
+
+    let comments = github::fetch_issue_comments(config, issue.number)
+        .await
+        .unwrap_or_default();
+
+    let issue_text = format!(
+        "Title: {}\nBody: {}\n\n--- COMMENTS HISTORY ---\n{}",
+        issue.title, issue_body, comments
+    );
+
+    let repo_tree = file_system::get_repo_tree(config);
+
+    // Plan
+    let lead_res = match plan_issue(config, prompts, &issue_text, &repo_tree).await {
+        Some(r) => r,
+        None => {
+            error!(issue = issue.number, "Planning failed — skipping issue");
+            return false;
+        }
+    };
+
+    info!(
+        agent = %lead_res.assigned_agent,
+        plan = %lead_res.architectural_plan,
+        files = ?lead_res.files_to_read,
+        "Plan ready"
+    );
+
+    // Token budget
+    let TokenBudgetResult {
+        lead_res,
+        remaining_files,
+        was_truncated,
+    } = apply_token_budget(lead_res);
+
+    // Dev loop
+    let result = execute_dev_loop(
+        config,
+        prompts,
+        &issue_text,
+        &repo_tree,
+        &lead_res,
+        &branch_name,
+    )
+    .await;
+
+    if !result.success {
+        error!(issue = issue.number, "Dev loop exhausted — no PR opened");
+        let _ = git_local::reset_to_main(config);
+        return false;
+    }
+
+    // AUTO-CONTINUE comment if we deferred files
+    if was_truncated {
+        // Push the partial work to the remote branch so it's not lost
+        let _ = git_local::push_to_remote(config, &branch_name);
+
+        let comment = format!(
+            "**[AUTO-CONTINUE] Partial completion**\n\n\
+             Successfully updated: `{:?}`.\n\n\
+             Still to process (next cycle): `{:?}`.\n\n\
+             *Picking this up automatically in the next cycle.*",
+            lead_res.files_to_read, remaining_files
+        );
+        let _ = github::create_issue_comment(config, issue.number, &comment).await;
+        info!(
+            issue = issue.number,
+            "AUTO-CONTINUE comment posted, branch saved"
+        );
+
+        // Do not mark as fully processed — leave it for the next cycle
+        // We also don't open a PR yet, and we don't delete the local branch.
+        return false;
+    }
+
+    // Deliver PR (Only executes if was_truncated is false, meaning the entire job is done)
+    match deliver_pr(
+        config,
+        issue.number,
+        &result.branch_name,
+        &result.thought_process,
+    )
+    .await
+    {
+        Ok(url) => {
+            info!(url = %url, "Pull request opened");
+        }
+        Err(e) => {
+            error!(err = %e, "Failed to open pull request");
+        }
+    }
+
+    // Cleanup local branch
+    git_local::delete_local_branch(config, &result.branch_name);
+    let _ = git_local::reset_to_main(config);
+
+    true
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/// Return the file path of the first file containing a known placeholder marker,
+/// or `None` if the submission looks complete.
+fn find_placeholder(dev_res: &DeveloperResponse) -> Option<String> {
+    for file in &dev_res.files_to_modify {
+        for marker in PLACEHOLDER_MARKERS {
+            if file.replace_block.contains(marker) {
+                return Some(file.file_path.clone());
+            }
+        }
+    }
+    None
 }
