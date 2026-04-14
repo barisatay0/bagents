@@ -19,3 +19,9 @@ EXPECTED JSON OUTPUT FORMAT:
     }
   ]
 }
+
+CRITICAL JSON FORMATTING RULES:
+1. You MUST properly escape all double quotes inside your code strings as \".
+2. You MUST properly escape all newlines inside your code strings as \n.
+3. DO NOT output raw unescaped strings. The Rust serde_json parser will FAIL with "invalid escape" if you do not follow this strictly.
+4. Keep your output concise but complete. Do not rewrite 500 lines of unchanged code if you only need to modify 3 lines, but ensure the final file is fully valid.
