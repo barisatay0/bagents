@@ -9,15 +9,15 @@ mod services;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize logger
+    env_logger::init();
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
-    env_logger::init();
     dotenv().ok();
     info!("========================================");
     info!("BAGENTS: Autonomous Software Factory ");
-    info!("========================================
-");
+    info!("========================================\n");
 
     // Start the complete autonomous factory workflow
     if let Err(e) = orchestrator::run_factory().await {
