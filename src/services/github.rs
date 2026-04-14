@@ -8,15 +8,20 @@ pub async fn fetch_open_issues() -> Result<Vec<Issue>, Box<dyn std::error::Error
 
     let octocrab = Octocrab::builder().personal_token(token).build()?;
 
-    // Fetch open issues from the repository
-    let issues = octocrab
+    let issues_page = octocrab
         .issues(owner, repo)
         .list()
         .state(octocrab::params::State::Open)
         .send()
         .await?;
 
-    Ok(issues.items)
+    let actual_issues: Vec<Issue> = issues_page
+        .items
+        .into_iter()
+        .filter(|issue| issue.pull_request.is_none())
+        .collect();
+
+    Ok(actual_issues)
 }
 
 pub async fn create_pull_request(
