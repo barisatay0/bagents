@@ -1,15 +1,17 @@
-use log::{debug, error, info, warn};
+use log::{info, warn, error};
 
-// ... existing code ...
-
-fn fetch_open_issues(...) {
-    info!("Fetching open issues for repository: {}", repo_name);
-    // ... original logic with error!(...) for failures ...
+pub fn fetch_open_issues() {
+    info!("Initiating GitHub issue fetch operation");
+    // ... existing implementation ...
+    if let Err(e) = some_github_call() {
+        error!("GitHub API error during issue fetch: {}", e);
+    }
 }
 
-fn create_pull_request(...) {
-    debug!("Creating PR from branch {} to {}", source, target);
-    // ... enhanced error messages with status codes ...
+pub fn create_pull_request(branch_name: &str) {
+    info!("Creating PR for branch: {}", branch_name);
+    // ... existing implementation ...
+    if validation_failed {
+        warn!("Skipping PR creation for branch: {} due to validation failure", branch_name);
+    }
 }
-
-// All println!/eprintln! replaced with log macros and contextual variables
