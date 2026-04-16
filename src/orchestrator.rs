@@ -205,12 +205,12 @@ async fn execute_dev_loop(
         file_system::read_semantic_outlines(config, lead_res.files_to_read.clone());
 
     for attempt in 1..=max_attempts {
-        info!(attempt, max_attempts, agent = %lead_res.assigned_agent, "Developer writing code");
+        info!(attempt, max_attempts, agent = %lead_res.assigned_agent, "Developer writing code on branch '{}' with token budget of {} files", branch_name, MAX_FILES_PER_CYCLE);
 
         // Reset uncommitted changes instead of hard resetting to main.
         // This ensures we stay on the current issue branch but wipe bad LLM code from previous attempts.
         if let Err(e) = git_local::reset_working_tree(config) {
-            error!(err = %e, "Could not reset working tree before attempt");
+            error!(err = %e, "Failed to reset working tree for attempt {} of {} on branch '{}'", attempt, max_attempts, branch_name);
             break;
         }
 
