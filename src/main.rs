@@ -45,12 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     tracing::info!(
-        owner = %config.github_owner,
-        repo = %config.github_repo,
-        workspace = %config.workspace_dir.display(),
-        model = %config.llm_model,
-        "Configuration loaded"
-    );
+    owner = %config.github_owner,
+    repo = %config.github_repo,
+    workspace = %config.workspace_dir.display(),
+    model = %config.llm_model,
+    token_preview = %config.get_masked_token(),
+    "BAGENTS Factory is online and authorized"
+);
 
     if let Err(e) = orchestrator::run_factory(&config, &prompts).await {
         tracing::error!(err = %e, "Factory encountered a fatal error");
