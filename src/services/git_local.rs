@@ -18,10 +18,12 @@ pub fn create_branch(config: &Config, branch_name: &str) -> Result<(), String> {
 /// Stage all changes and commit with the given message.
 /// Succeeds silently when there is nothing to commit.
 pub fn commit_changes(config: &Config, message: &str) -> Result<(), String> {
+    info!("Initiating git commit process: Staging all changes for commit");
     debug!("Staging and committing changes");
 
     run(config, &["add", "."])?;
 
+    info!("Executing git commit with message: '{}'", message);
     let out = run(config, &["commit", "-m", message])?;
     let stdout = String::from_utf8_lossy(&out.stdout).to_lowercase();
 
