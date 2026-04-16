@@ -6,6 +6,17 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub github_token: String,
+
+    pub fn get_masked_token(&self) -> String {
+        let token = &self.github_token;
+        if token.len() <= 8 {
+            "***REDACTED***".to_string()
+        } else {
+            let first_four = &token[0..4];
+            let last_four = &token[token.len() - 4..];
+            format!("{}...{}", first_four, last_four)
+        }
+    }
     pub github_owner: String,
     pub github_repo: String,
     pub workspace_dir: PathBuf,
