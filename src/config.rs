@@ -6,7 +6,7 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct Config {
     pub openai_api_key: String,
-    pub openai_model: String,
+    pub github_token: String,
     pub llm_max_retries: u32,
 }
 
@@ -16,17 +16,15 @@ impl Config {
 pub fn from_env() -> Result<Self, String> {
     let openai_api_key = std::env::var("OPENAI_API_KEY")
         .map_err(|_| "OPENAI_API_KEY environment variable is not set".to_string())?;
-    
-    let openai_model = std::env::var("OPENAI_MODEL")
-        .unwrap_or_else(|_| "gpt-4-turbo".to_string());
-    
+    let github_token = std::env::var("GITHUB_TOKEN")
+        .map_err(|_| "GITHUB_TOKEN environment variable is not set".to_string())?;
     let llm_max_retries = std::env::var("LLM_MAX_RETRIES")
-        .map(|s| s.parse::<u32>().unwrap_or(5u32))
-        .unwrap_or(5u32);
+        .map(|s| s.parse::<u32>().map_err(|_| "LLM_MAX_RETRIES must be a valid u32".to_string()))
+        .unwrap_or(Ok(5u32))?;
     
     Ok(Self {
         openai_api_key,
-        openai_model,
+        github_token,
         llm_max_retries,
     })
 }
