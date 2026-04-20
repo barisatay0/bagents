@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  bagents:
+    build:
+      context: .
+      args:
+        - PROJECT_LANG=node
+    container_name: bagents-factory
+    env_file:
+      - .env
+    environment:
+      - WORKSPACE_DIR=/workspace
+    volumes:
+      - ${WORKSPACE_DIR:-./target_repo}:/workspace
+      - ~/.ssh:/root/.ssh:ro
+    tty: true
