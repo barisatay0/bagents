@@ -1,93 +1,126 @@
-# BAGENTS
+# BAGENTS: Autonomous AI Software Engineer
 
-[![Rust](https://img.shields.io/badge/Rust-1.75+-orange.svg)](https://www.rust-lang.org/)
-[![AI Powered](https://img.shields.io/badge/AI-Powered-purple.svg)]()
+BAGENTS is an autonomous, multi-agent AI coding framework built in Rust. It functions as an automated software engineer that monitors your GitHub repositories for open issues, writes the necessary code to resolve them, verifies the changes, and automatically opens a Pull Request without human intervention.
 
-**BAGENTS** is an autonomous, multi-agent AI software factory built in Rust. It monitors your GitHub repositories for open issues, assigns them to specialized AI agents (Backend, Frontend, DevOps), writes the code, reviews it, and automatically opens a Pull Request—all without human intervention.
+Instead of operating as a simple chat assistant, BAGENTS uses a multi-agent architecture and semantic code understanding to safely modify large codebases.
 
-## ✨ Key Features
+---
 
-* **🕵️‍♂️ Autonomous Issue Processing:** Automatically fetches open issues from your GitHub repository using the GitHub API (`octocrab`).
-* **🧠 Multi-Agent Orchestration:**
-    * **Team Leader:** Analyzes the issue and generates an architectural plan.
-    * **Developer Agents:** Specialized agents (`backend_dev`, `frontend_dev`, `devops_dev`) write the code based on the architectural plan.
-    * **Code Reviewer:** A strict, detail-oriented agent that reviews the generated code.
-* **🔄 Self-Correcting Feedback Loop:** If the Code Reviewer rejects the code, it leaves a comment on the GitHub issue, and the Developer agent automatically attempts to fix the code (up to 3 attempts).
-* **🌐 Cross-Repository Support:** BAGENTS can run in its own directory while targeting and modifying code in a completely different workspace (`WORKSPACE_DIR`).
-* **📦 Automated Git Operations:** Automatically creates branches, commits changes, and pushes to the remote repository.
-* **🚀 Automated Pull Requests:** Opens a fully formatted Pull Request once the code passes the AI review.
-* **LLM Agnostic:** Works with OpenAI-compatible APIs (tested perfectly with Groq's `llama-3.3-70b-versatile` and local Ollama models).
+## How It Works
 
-## 🛠️ System Architecture
+The system operates in a continuous, multi-stage workflow:
 
-The factory operates in a continuous, multi-stage workflow:
+### 1. Ingestion
+Polls your target GitHub repository for the latest open issues.
 
-1.  **Ingestion:** Reads the latest open issue from the target GitHub repo.
-2.  **Planning:** The `team_lead` LLM outputs a JSON plan and assigns a worker.
-3.  **Execution:** The assigned worker (e.g., `backend_dev`) writes the code and modifies the file system in the target `WORKSPACE_DIR`.
-4.  **Review:** The `reviewer` LLM checks the `git diff`.
-5.  **Iteration (Optional):** If rejected, the reviewer posts feedback to the GitHub issue, and the workflow loops back to Execution.
-6.  **Delivery:** If approved, the system pushes the branch via SSH and opens a PR via the GitHub API.
+### 2. Planning
+A Team Lead agent analyzes the issue, reads the relevant repository structure, and generates an architectural plan, assigning the task to a specialized developer agent (Backend, Frontend, or DevOps).
 
-## 🚀 Getting Started
+### 3. Execution
+The Developer agent writes the code. The system uses Tree-sitter for semantic chunking, allowing the agent to target and replace specific functions or structs without breaking the rest of the file.
 
-### 1. Prerequisites
-* [Rust](https://www.rust-lang.org/tools/install) installed on your machine.
-* Git configured with SSH access to your GitHub account (`git push` must work without a password prompt).
-* A GitHub Personal Access Token (Classic) with `repo` permissions.
-* An LLM API Key (e.g., Groq API key or a running local Ollama instance).
+### 4. Verification
+The system runs your project's local test or build command (e.g., `cargo check`, `npm test`). If it fails, the error output is fed back to the agent for self-correction.
 
-### 2. Installation
-Clone the repository:
+### 5. Review
+A Code Reviewer agent analyzes the git diff. If the code is rejected, the workflow loops back to the developer with feedback.
+
+### 6. Delivery
+Once approved, the system commits the changes, pushes the branch via SSH, and opens a Pull Request on GitHub.
+
+---
+
+BAGENTS is LLM-agnostic and works with any OpenAI-compatible API, including Groq, local Ollama instances, and standard OpenAI models.
+
+---
+
+## How to Run
+
+### Prerequisites
+
+- Git configured with SSH access to your GitHub account (pushing must work without a password prompt)
+- A GitHub Personal Access Token (Classic) with repository permissions
+- An LLM API Key (e.g., Groq, OpenAI)
+- Docker and Docker Compose (Recommended) **OR** Rust installed locally
+
+---
+
+## Installation
+
+Clone the repository to your local machine:
+
 ```bash
 git clone git@github.com:[YOUR_USERNAME]/bagents.git
 cd bagents
 ```
 
-### 3. Configuration
-Create a .env file in the root directory of the project. You must configure both your LLM provider and your GitHub details.
+## Configuration
 
-#### --- LLM CONFIGURATION (Example using Groq) ---
-LLM_API_KEY="gsk_your_groq_api_key_here"
-LLM_API_URL="[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)"
+Create a `.env` file in the root directory of the project. This file requires your LLM provider details, GitHub credentials, and the path to the target repository you want the AI to modify.
+
+### Example `.env` configuration:
+
+```env
+LLM_API_KEY="your_llm_api_key_here"
+LLM_API_URL="https://api.groq.com/openai/v1/chat/completions"
 LLM_MODEL="llama-3.3-70b-versatile"
 LLM_TEMPERATURE="0.2"
 
-#### --- GITHUB CONFIGURATION ---
-GITHUB_TOKEN="ghp_your_github_personal_access_token_here"
-GITHUB_OWNER="your_github_username"
+GITHUB_TOKEN="your_github_personal_access_token_here"
+GITHUB_OWNER="target_github_username"
 GITHUB_REPO="target_repository_name"
 
-#### --- WORKSPACE CONFIGURATION ---
-#### The absolute path where the target repository is located on your local machine.
-#### Bagents will perform git operations and file modifications inside this directory.
-WORKSPACE_DIR="/home/your_username/projects/target_repository_name"
+# The absolute path where the target repository is located
+WORKSPACE_DIR="/workspace"
 
-# Usage
-Go to your target GitHub repository and create a new Issue. Be descriptive (e.g., "Create a fast Fibonacci function in Rust in src/math.rs").
+# The command used to verify the code before review
+VERIFY_COMMAND="cargo check"
+```
 
-Run the BAGENTS orchestrator from your bagents directory:
+---
+
+## Execution
+
+### Recommended: Using Docker
+
+Running BAGENTS via Docker ensures that the AI has a safe, isolated environment with the correct language dependencies.
+
+1. Open the `docker-compose.yml` file  
+2. Ensure `PROJECT_LANG` matches your repo (`rust`, `node`, `python`)  
+3. Ensure volume mapping points to your target repository  
+
+Start the agent:
+
+```bash
+docker compose up --build
+```
+
+The agent will immediately begin polling GitHub for issues, checking out branches, and writing code in the mapped volume.
+
+---
+
+### Alternative: Run Locally
+
+1. Update `WORKSPACE_DIR` in your `.env` file to the absolute path of your repository (e.g., `/home/user/projects/target_repo`)  
+2. Ensure required language toolchains (Rust, Node.js, etc.) are installed  
+3. Start the system:
 
 ```bash
 cargo run
 ```
 
-Watch the terminal as the agents analyze the issue, write the code, review each other, and finally provide you with a completed Pull Request!
+## Usage
 
-## Project Structure
-src/orchestrator.rs: The core engine managing the agent workflow and feedback loops.
+To trigger BAGENTS:
 
-src/clients/llm_client.rs: Handles communication with OpenAI-compatible APIs.
+1. Go to your target repository on GitHub  
+2. Create a new Issue  
+3. Describe the task clearly and in detail  
 
-src/services/: Contains integrations for github, git_local, and file_system.
+**Example:**
 
-config/: Contains the Markdown prompt files that define the persona and rules for each AI agent (team_lead.md, backend_dev.md, reviewer.md, etc.).
+```text
+Implement a user authentication middleware in src/middleware.ts
+```
 
-## Important Notes
-JSON Enforcement: The prompts in the config/ directory heavily enforce valid JSON output. Modifying these prompts requires strict attention to JSON syntax instructions to prevent parsing panics.
-
-Rate Limits: Be mindful of your LLM API rate limits, especially when the feedback loop is triggered multiple times.
-
-## Contributing
-Contributions are welcome! If you want to add new agent types (e.g., qa_engineer or security_auditor) or implement RAG to allow agents to read the entire codebase, feel free to open a PR.
-
+BAGENTS will automatically detect the issue and begin processing it within a minute.
