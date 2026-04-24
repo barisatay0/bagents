@@ -15,6 +15,10 @@ pub struct Config {
     pub llm_temperature: f32,
     pub json_mode: String,
     pub verify_command: String,
+    /// Max tokens for normal (planner / reviewer) requests.
+    pub llm_max_tokens: u32,
+    /// Max tokens for developer agent requests that write full file content.
+    pub llm_max_tokens_large: u32,
 }
 
 impl Config {
@@ -32,6 +36,15 @@ impl Config {
             };
         }
 
+        macro_rules! optional_u32 {
+            ($key:expr, $default:expr) => {
+                env::var($key)
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or($default)
+            };
+        }
+
         let github_token = require!("GITHUB_TOKEN");
         let github_owner = require!("GITHUB_OWNER");
         let github_repo = require!("GITHUB_REPO");
@@ -46,8 +59,13 @@ impl Config {
             .unwrap_or(0.2);
 
         let json_mode = env::var("LLM_JSON_MODE").unwrap_or_else(|_| "openai".to_string());
-
         let verify_command = env::var("VERIFY_COMMAND").unwrap_or_default();
+
+        // Token limits — generous defaults so agents never silently truncate.
+        // Most frontier models support 8 192 – 32 768 output tokens.
+        // Override via .env if your provider has a lower ceiling.
+        let llm_max_tokens = optional_u32!("LLM_MAX_TOKENS", 4096);
+        let llm_max_tokens_large = optional_u32!("LLM_MAX_TOKENS_LARGE", 8192);
 
         if !errors.is_empty() {
             return Err(format!(
@@ -75,6 +93,8 @@ impl Config {
             llm_temperature,
             json_mode,
             verify_command,
+            llm_max_tokens,
+            llm_max_tokens_large,
         })
     }
 }
