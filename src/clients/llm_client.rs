@@ -9,18 +9,10 @@ use crate::helpers::helper_output::output;
 const MIN_RESPONSE_CHARS: usize = 50;
 const TRUNCATION_FINISH_REASONS: &[&str] = &["length", "max_tokens", "content_filter"];
 
-// Anthropic beta header value that enables prompt caching.
-// Ignored automatically by non-Anthropic endpoints because they never check it.
 const ANTHROPIC_CACHE_BETA: &str = "prompt-caching-2024-10-22";
 
-// Anthropic requires a cached block to be at least 1 024 tokens.
-// We only attach cache_control when the text exceeds this conservative byte
-// threshold (1 char ≈ 0.75 tokens on average; 1 400 bytes ≈ 1 050 tokens).
 const CACHE_MIN_BYTES: usize = 1_400;
 
-/// The tool definition sent to the LLM for developer agent requests.
-/// The schema mirrors `DeveloperResponse` exactly so the orchestrator needs
-/// no changes — we just deserialise `tool_use.input` instead of text content.
 fn apply_patch_tool() -> Value {
     json!({
         "name": "apply_patch",
@@ -73,7 +65,7 @@ fn apply_patch_tool() -> Value {
                                     "properties": {
                                         "search": {
                                             "type": "string",
-                                            "description": "Exact lines to find — include 2-3 lines of unchanged context above and below the edit. Must appear verbatim in the file."
+                                            "description": "Exact lines to find — include 2-3 lines of unchanged context above and below the edit site. Must appear verbatim in the file."
                                         },
                                         "replace": {
                                             "type": "string",
@@ -90,7 +82,41 @@ fn apply_patch_tool() -> Value {
     })
 }
 
-// ── public API ────────────────────────────────────────────────────────────────
+pub fn read_file_tool() -> Value {
+    json!({
+        "name": "read_file",
+        "description": "Read the content of a file in the workspace before writing patches. Use this to inspect exact line content, confirm indentation, or understand surrounding context before calling apply_patch. You may call read_file multiple times before calling apply_patch.",
+        "input_schema": {
+            "type": "object",
+            "required": ["file_path"],
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Relative path inside the workspace, e.g. src/config.rs"
+                },
+                "start_line": {
+                    "type": "integer",
+                    "description": "1-based line number to start reading from (inclusive). Omit to read from the beginning."
+                },
+                "end_line": {
+                    "type": "integer",
+                    "description": "1-based line number to stop reading at (inclusive). Omit to read to the end of the file."
+                }
+            }
+        }
+    })
+}
+
+pub enum DevTurnResult {
+    ReadFile {
+        tool_use_id: String,
+        file_path: String,
+        start_line: Option<usize>,
+        end_line: Option<usize>,
+    },
+    ApplyPatch(String),
+    Error(String),
+}
 
 pub async fn ask(
     config: &Config,
@@ -108,10 +134,6 @@ pub async fn ask_large(
     ask_inner(config, system_prompt, user_prompt, true, None).await
 }
 
-/// Like `ask_large` but accepts an optional large static context string (e.g.
-/// the repository tree + file contents) that should be prompt-cached on
-/// Anthropic endpoints.  On non-Anthropic endpoints the string is simply
-/// appended to the user prompt with no cache annotation.
 pub async fn ask_large_with_context(
     config: &Config,
     system_prompt: &str,
@@ -121,14 +143,218 @@ pub async fn ask_large_with_context(
     ask_inner(config, system_prompt, user_prompt, true, Some(static_context)).await
 }
 
-// ── core implementation ───────────────────────────────────────────────────────
+pub async fn ask_dev_turn(
+    config: &Config,
+    system_prompt: &str,
+    conversation: &[Value],
+    use_anthropic_cache: bool,
+) -> DevTurnResult {
+    let client = match Client::builder().timeout(Duration::from_secs(180)).build() {
+        Ok(c) => c,
+        Err(e) => return DevTurnResult::Error(e.to_string()),
+    };
+
+    let max_tokens = config.llm_max_tokens_large;
+
+    let body = build_dev_turn_body(config, system_prompt, conversation, max_tokens, use_anthropic_cache);
+    let payload = match serde_json::to_string(&body) {
+        Ok(p) => p,
+        Err(e) => return DevTurnResult::Error(e.to_string()),
+    };
+
+    let mut retries = 0u32;
+    let max_retries = 6u32;
+
+    loop {
+        let mut req = client
+            .post(&config.llm_api_url)
+            .bearer_auth(&config.llm_api_key)
+            .header(reqwest::header::CONTENT_TYPE, "application/json");
+
+        if use_anthropic_cache {
+            req = req.header("anthropic-beta", ANTHROPIC_CACHE_BETA);
+        }
+
+        let res = match req.body(payload.clone()).send().await {
+            Ok(r) => r,
+            Err(e) => return DevTurnResult::Error(e.to_string()),
+        };
+
+        let status = res.status();
+        let res_text = match res.text().await {
+            Ok(t) => t,
+            Err(e) => return DevTurnResult::Error(e.to_string()),
+        };
+
+        let is_rate_limit = status == StatusCode::TOO_MANY_REQUESTS
+            || (!status.is_success()
+                && (res_text.to_lowercase().contains("rate limit")
+                    || res_text.to_lowercase().contains("try again in")
+                    || res_text.to_lowercase().contains("quota exceeded")));
+
+        if is_rate_limit {
+            if retries >= max_retries {
+                return DevTurnResult::Error(format!(
+                    "LLM API rate limit hit {} times — giving up: {}",
+                    max_retries, res_text
+                ));
+            }
+            let base_wait = 15u64 * (1u64 << retries.min(4));
+            let jitter = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_millis()
+                % 5000) as u64
+                / 1000;
+            let wait = base_wait + jitter;
+            warn!(attempt = retries + 1, max_retries, wait_secs = wait, "Rate limit — backing off");
+            sleep(Duration::from_secs(wait)).await;
+            retries += 1;
+            continue;
+        }
+
+        if !status.is_success() {
+            return DevTurnResult::Error(format!("LLM API HTTP {}: {}", status, res_text));
+        }
+
+        let res_json: Value = match serde_json::from_str(&res_text) {
+            Ok(v) => v,
+            Err(e) => {
+                return DevTurnResult::Error(format!(
+                    "LLM API returned non-JSON (status {}): {} — parse err: {}",
+                    status,
+                    &res_text[..res_text.len().min(200)],
+                    e
+                ))
+            }
+        };
+
+        if res_json["error"].is_object() {
+            let err_msg = res_json["error"]["message"].as_str().unwrap_or("Unknown API error");
+            return DevTurnResult::Error(format!("LLM API Error: {}", err_msg));
+        }
+
+        if use_anthropic_cache {
+            log_cache_stats(&res_json);
+        }
+
+        return extract_dev_turn(&res_json, &res_text);
+    }
+}
+
+fn build_dev_turn_body(
+    config: &Config,
+    system_prompt: &str,
+    conversation: &[Value],
+    max_tokens: u32,
+    use_cache: bool,
+) -> Value {
+    let system = if use_cache {
+        json!([{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": { "type": "ephemeral" }
+        }])
+    } else {
+        json!(system_prompt)
+    };
+
+    let tools = json!([read_file_tool(), apply_patch_tool()]);
+
+    if use_cache || is_anthropic_endpoint(config) {
+        json!({
+            "model": config.llm_model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": conversation,
+            "tools": tools,
+            "tool_choice": { "type": "any" },
+            "temperature": config.llm_temperature
+        })
+    } else {
+        let mut messages = vec![json!({ "role": "system", "content": system_prompt })];
+        messages.extend_from_slice(conversation);
+        json!({
+            "model": config.llm_model,
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": "required",
+            "temperature": config.llm_temperature
+        })
+    }
+}
+
+fn extract_dev_turn(res_json: &Value, raw_text: &str) -> DevTurnResult {
+    if let Some(content_arr) = res_json["content"].as_array() {
+        for block in content_arr {
+            if block["type"].as_str() != Some("tool_use") {
+                continue;
+            }
+
+            let tool_use_id = block["id"].as_str().unwrap_or("").to_string();
+            let name = block["name"].as_str().unwrap_or("");
+
+            if name == "read_file" {
+                let input = &block["input"];
+                let file_path = input["file_path"].as_str().unwrap_or("").to_string();
+                let start_line = input["start_line"].as_u64().map(|n| n as usize);
+                let end_line = input["end_line"].as_u64().map(|n| n as usize);
+                debug!(file = %file_path, start = ?start_line, end = ?end_line, "Agent requested read_file");
+                return DevTurnResult::ReadFile { tool_use_id, file_path, start_line, end_line };
+            }
+
+            if name == "apply_patch" {
+                let serialised = match serde_json::to_string(&block["input"]) {
+                    Ok(s) => s,
+                    Err(e) => return DevTurnResult::Error(format!("Failed to serialise apply_patch input: {}", e)),
+                };
+                debug!(chars = serialised.len(), "Extracted apply_patch (Anthropic shape)");
+                return DevTurnResult::ApplyPatch(serialised);
+            }
+        }
+    }
+
+    if let Some(tool_calls) = res_json["choices"][0]["message"]["tool_calls"].as_array() {
+        for call in tool_calls {
+            let name = call["function"]["name"].as_str().unwrap_or("");
+            let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
+
+            if name == "read_file" {
+                let tool_use_id = call["id"].as_str().unwrap_or("").to_string();
+                let input: Value = serde_json::from_str(args_str).unwrap_or_default();
+                let file_path = input["file_path"].as_str().unwrap_or("").to_string();
+                let start_line = input["start_line"].as_u64().map(|n| n as usize);
+                let end_line = input["end_line"].as_u64().map(|n| n as usize);
+                debug!(file = %file_path, "Agent requested read_file (OpenAI shape)");
+                return DevTurnResult::ReadFile { tool_use_id, file_path, start_line, end_line };
+            }
+
+            if name == "apply_patch" {
+                match serde_json::from_str::<Value>(args_str) {
+                    Ok(parsed) => {
+                        let serialised = serde_json::to_string(&parsed).unwrap_or_default();
+                        debug!(chars = serialised.len(), "Extracted apply_patch (OpenAI shape)");
+                        return DevTurnResult::ApplyPatch(serialised);
+                    }
+                    Err(e) => return DevTurnResult::Error(format!("Failed to parse apply_patch args: {}", e)),
+                }
+            }
+        }
+    }
+
+    warn!("No tool_use block found — falling back to text extraction");
+    let text_content = res_json["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or(raw_text);
+    DevTurnResult::ApplyPatch(output(text_content))
+}
 
 async fn ask_inner(
     config: &Config,
     system_prompt: &str,
     user_prompt: &str,
     large_response: bool,
-    // Optional static context to cache (repo tree, file contents, etc.)
     static_context: Option<&str>,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let client = Client::builder()
@@ -141,11 +367,8 @@ async fn ask_inner(
         config.llm_max_tokens
     };
 
-    // Developer agent requests use tool calling; planner/reviewer use JSON mode.
     let use_tool_calling = large_response && is_tool_calling_supported(config);
     let use_anthropic_cache = is_anthropic_endpoint(config);
-
-    // ── Build request body ────────────────────────────────────────────────────
 
     let body = if use_tool_calling {
         build_anthropic_tool_body(
@@ -185,8 +408,6 @@ async fn ask_inner(
         "Sending LLM request"
     );
 
-    // ── Retry loop ────────────────────────────────────────────────────────────
-
     let mut retries = 0u32;
     let max_retries = 6u32;
 
@@ -196,7 +417,6 @@ async fn ask_inner(
             .bearer_auth(&config.llm_api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
 
-        // Attach the prompt-caching beta header for Anthropic endpoints.
         if use_anthropic_cache {
             req = req.header("anthropic-beta", ANTHROPIC_CACHE_BETA);
         }
@@ -206,7 +426,6 @@ async fn ask_inner(
         let status = res.status();
         let res_text = res.text().await?;
 
-        // ── Rate-limit detection ──────────────────────────────────────────────
         let is_rate_limit = status == StatusCode::TOO_MANY_REQUESTS
             || (!status.is_success()
                 && (res_text.to_lowercase().contains("rate limit")
@@ -261,31 +480,24 @@ async fn ask_inner(
             return Err(format!("LLM API Error: {}", err_msg).into());
         }
 
-        // Log cache usage when available (Anthropic includes this in usage).
         if use_anthropic_cache {
             log_cache_stats(&res_json);
         }
 
-        // ── Tool-calling response extraction ──────────────────────────────────
         if use_tool_calling {
             return extract_tool_response(&res_json, &res_text, retries, max_retries);
         }
 
-        // ── Standard text response extraction ─────────────────────────────────
-        // Anthropic text responses use `content[0].text`; OpenAI uses
-        // `choices[0].message.content`.  Try both shapes.
         let raw_content = extract_text_content(&res_json);
 
         let finish_reason = res_json["choices"][0]["finish_reason"]
             .as_str()
-            // Anthropic uses `stop_reason` at the top level
             .or_else(|| res_json["stop_reason"].as_str())
             .unwrap_or("stop")
             .to_string();
 
         let usage_completion = res_json["usage"]["completion_tokens"]
             .as_u64()
-            // Anthropic calls this `output_tokens`
             .or_else(|| res_json["usage"]["output_tokens"].as_u64())
             .unwrap_or(0);
 
@@ -363,15 +575,6 @@ async fn ask_inner(
     }
 }
 
-// ── body builders ─────────────────────────────────────────────────────────────
-
-/// Build an Anthropic-native request body with `cache_control` breakpoints on:
-///   1. The system prompt (always static across all calls for a given agent role).
-///   2. The static context block (repo tree + file contents), when provided and
-///      large enough to exceed Anthropic's minimum cacheable token count.
-///
-/// The dynamic user prompt (issue text + feedback) is always sent uncached so
-/// that changes between dev-loop attempts are reflected immediately.
 fn build_anthropic_tool_body(
     config: &Config,
     system_prompt: &str,
@@ -380,7 +583,6 @@ fn build_anthropic_tool_body(
     max_tokens: u32,
     use_cache: bool,
 ) -> Value {
-    // System block — always cache when using Anthropic.
     let system = if use_cache {
         json!([{
             "type": "text",
@@ -391,7 +593,6 @@ fn build_anthropic_tool_body(
         json!(system_prompt)
     };
 
-    // User message — split into [cached static context] + [dynamic prompt].
     let user_content = build_user_content(user_prompt, static_context, use_cache);
 
     json!({
@@ -407,10 +608,6 @@ fn build_anthropic_tool_body(
     })
 }
 
-/// Build an Anthropic-native request body for planner / reviewer (text mode).
-/// Adds `cache_control` on the system prompt and, if large enough, the static
-/// context block.  A `response_format` field is NOT included — Anthropic's API
-/// doesn't support it; JSON output is enforced via the system prompt instead.
 fn build_anthropic_text_body(
     config: &Config,
     system_prompt: &str,
@@ -437,9 +634,6 @@ fn build_anthropic_text_body(
     })
 }
 
-/// Build an OpenAI-compatible request body.  No `cache_control` fields are
-/// added; OpenAI's automatic prompt caching works transparently on their end
-/// without any request-side annotation.
 fn build_openai_body(
     config: &Config,
     system_prompt: &str,
@@ -448,7 +642,6 @@ fn build_openai_body(
     max_tokens: u32,
     use_tool_calling: bool,
 ) -> Value {
-    // Merge static context into the user turn (flat string, no annotations).
     let full_user = match static_context {
         Some(ctx) if !ctx.is_empty() => format!("{}\n\n{}", ctx, user_prompt),
         _ => user_prompt.to_string(),
@@ -478,7 +671,6 @@ fn build_openai_body(
         })
     };
 
-    // JSON mode for planner / reviewer on OpenAI-compatible endpoints.
     if !use_tool_calling {
         match config.json_mode.to_lowercase().as_str() {
             "openai" | "groq" | "true" => {
@@ -494,18 +686,7 @@ fn build_openai_body(
     body
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Construct the `content` array for the user turn.
-///
-/// When `use_cache` is true and a static context is provided with enough bytes,
-/// the context block is annotated with `cache_control` so Anthropic can cache
-/// it independently of the dynamic user prompt that follows.
-///
-/// Layout:
-///   [cached static context block]  ← cache_control: ephemeral  (if large enough)
-///   [dynamic user prompt block]    ← no cache annotation
-fn build_user_content(
+pub fn build_user_content(
     user_prompt: &str,
     static_context: Option<&str>,
     use_cache: bool,
@@ -526,7 +707,6 @@ fn build_user_content(
                     }
                 ])
             } else {
-                // Context below threshold or caching disabled: merge into one block.
                 json!([{
                     "type": "text",
                     "text": format!("{}\n\n{}", ctx, user_prompt)
@@ -537,9 +717,7 @@ fn build_user_content(
     }
 }
 
-/// Extract the text content from either an Anthropic or OpenAI response shape.
 fn extract_text_content(res_json: &Value) -> String {
-    // Anthropic: { "content": [{ "type": "text", "text": "..." }] }
     if let Some(content_arr) = res_json["content"].as_array() {
         for block in content_arr {
             if block["type"].as_str() == Some("text") {
@@ -549,16 +727,12 @@ fn extract_text_content(res_json: &Value) -> String {
             }
         }
     }
-    // OpenAI: { "choices": [{ "message": { "content": "..." } }] }
     res_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or("")
         .to_string()
 }
 
-/// Log Anthropic prompt-caching statistics when present in the response.
-/// These fields are only present on Anthropic API responses; nothing happens
-/// for OpenAI/Groq because those fields will simply be null.
 fn log_cache_stats(res_json: &Value) {
     let usage = &res_json["usage"];
     let read = usage["cache_read_input_tokens"].as_u64().unwrap_or(0);
@@ -575,30 +749,17 @@ fn log_cache_stats(res_json: &Value) {
     }
 }
 
-/// Returns true when the configured endpoint looks like the Anthropic API.
-/// We use this to decide whether to:
-///   (a) send an `anthropic-beta` header, and
-///   (b) use Anthropic's content-block message format with `cache_control`.
-fn is_anthropic_endpoint(config: &Config) -> bool {
+pub fn is_anthropic_endpoint(config: &Config) -> bool {
     config.llm_api_url.contains("anthropic.com")
         || config.llm_api_url.contains("api.anthropic")
 }
 
-/// Extract and serialise the `apply_patch` tool call input as a JSON string
-/// so the caller (`orchestrator.rs`) can deserialise it into `DeveloperResponse`
-/// without any changes.
-///
-/// Supports both Anthropic-style (`content[].type == "tool_use"`) and
-/// OpenAI-style (`choices[0].message.tool_calls[0]`) response shapes so the
-/// same code works with Groq, OpenAI, and Claude API endpoints.
 fn extract_tool_response(
     res_json: &Value,
     raw_text: &str,
     retries: u32,
     max_retries: u32,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // ── Anthropic API shape ────────────────────────────────────────────────
-    // {"content": [{"type": "tool_use", "name": "apply_patch", "input": {...}}]}
     if let Some(content_arr) = res_json["content"].as_array() {
         for block in content_arr {
             if block["type"].as_str() == Some("tool_use")
@@ -615,8 +776,6 @@ fn extract_tool_response(
         }
     }
 
-    // ── OpenAI / Groq API shape ───────────────────────────────────────────
-    // {"choices":[{"message":{"tool_calls":[{"function":{"name":"apply_patch","arguments":"{...}"}}]}}]}
     if let Some(tool_calls) = res_json["choices"][0]["message"]["tool_calls"].as_array() {
         for call in tool_calls {
             if call["function"]["name"].as_str() == Some("apply_patch") {
@@ -632,28 +791,18 @@ fn extract_tool_response(
         }
     }
 
-    // ── Fallback: model emitted text despite tool_choice: any ─────────────
-    // Some providers (older Ollama, misc proxies) ignore tool_choice. Fall
-    // back to text extraction so the orchestrator still gets something to work with.
     warn!("No tool_use block found in response — falling back to text extraction");
-    if retries < max_retries {
-        // The orchestrator will handle the parse error and retry with feedback.
-    }
     let text_content = res_json["choices"][0]["message"]["content"]
         .as_str()
         .unwrap_or(raw_text);
     Ok(output(text_content))
 }
 
-/// Returns true when the configured provider is known to support tool calling
-/// well enough to rely on it. Ollama support is patchy, so we disable it there.
-fn is_tool_calling_supported(config: &Config) -> bool {
+pub fn is_tool_calling_supported(config: &Config) -> bool {
     let mode = config.json_mode.to_lowercase();
-    // "none" means the user explicitly disabled structured output features.
     if mode == "none" {
         return false;
     }
-    // Ollama's tool-calling support is model-dependent and often unreliable.
     if mode == "ollama" {
         return false;
     }

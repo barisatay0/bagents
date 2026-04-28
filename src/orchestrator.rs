@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
-use crate::clients::llm_client;
+use crate::clients::llm_client::{
+    self, DevTurnResult, build_user_content, is_anthropic_endpoint, is_tool_calling_supported,
+};
 use crate::config::Config;
 use crate::models::{
     developer_response::DeveloperResponse, reviewer_response::ReviewerResponse,
@@ -11,33 +13,15 @@ use crate::models::{
 use crate::prompts::Prompts;
 use crate::services::{file_system, git_local, github};
 
-/// Placeholder markers that indicate an agent submitted incomplete code.
 const PLACEHOLDER_MARKERS: &[&str] = &[
-    "// TODO",
-    "// FIXME",
-    "// HACK",
-    "// XXX",
-    "todo!()",
-    "unimplemented!()",
-    "... existing code ...",
-    "/* TODO */",
-    "# TODO",
-    "FIXME",
-    "// ...",
-    "{/* ... */}",
-    "// rest of",
-    "// ... rest",
-    "/* rest of",
+    "// TODO", "// FIXME", "// HACK", "// XXX", "todo!()", "unimplemented!()",
+    "... existing code ...", "/* TODO */", "# TODO", "FIXME", "// ...",
+    "{/* ... */}", "// rest of", "// ... rest", "/* rest of",
 ];
 
-/// Maximum number of files passed to a developer agent per cycle.
-/// Keeping this at 2 gives better context while still protecting the window.
 const MAX_FILES_PER_CYCLE: usize = 2;
+const MAX_READ_FILE_TURNS: usize = 8;
 
-// ── entry point ───────────────────────────────────────────────────────────────
-
-/// Main factory loop. Polls GitHub for open issues, orchestrates agents,
-/// reviews code, and opens pull requests until interrupted.
 pub async fn run_factory(
     config: &Config,
     prompts: &Prompts,
@@ -76,7 +60,6 @@ pub async fn run_factory(
             "Processing issue"
         );
 
-        // Always start from a clean main branch
         if let Err(e) = git_local::reset_to_main(config) {
             error!(err = %e, "Could not reset to main — skipping issue");
             sleep(Duration::from_secs(10)).await;
@@ -99,17 +82,6 @@ pub async fn run_factory(
     }
 }
 
-// ── stage 1: plan ─────────────────────────────────────────────────────────────
-
-/// Ask the team lead to analyse the issue and produce an architectural plan.
-///
-/// The team lead receives:
-///   • The repository map (file paths + symbol signatures, no bodies) as a
-///     **cached** static context block — this stays constant for all issues in
-///     the same run, so Anthropic will serve it from cache on the 2nd+ call.
-///   • The issue text as the dynamic (uncached) user prompt.
-///
-/// Returns `None` if the LLM returns unparseable JSON after logging the error.
 async fn plan_issue(
     config: &Config,
     prompts: &Prompts,
@@ -118,8 +90,6 @@ async fn plan_issue(
 ) -> Option<TeamLeaderResponse> {
     info!("Team leader is planning...");
 
-    // The repo map is static across issues within a run → ideal cache candidate.
-    // The issue text changes every call → must stay dynamic (uncached).
     let user_prompt = format!(
         "Issue to resolve:\n\
          {issue_text}\n\n\
@@ -132,7 +102,7 @@ async fn plan_issue(
     let raw = match llm_client::ask_large_with_context(
         config,
         &prompts.team_lead,
-        repo_map,   // static context — cached on Anthropic
+        repo_map,
         &user_prompt,
     )
     .await
@@ -153,16 +123,12 @@ async fn plan_issue(
     }
 }
 
-// ── stage 2: token budget ─────────────────────────────────────────────────────
-
 struct TokenBudgetResult {
     lead_res: TeamLeaderResponse,
     remaining_files: Vec<String>,
     was_truncated: bool,
 }
 
-/// Enforce the per-cycle file limit. Injects a SYSTEM OVERRIDE into the
-/// architectural plan and records the spilled files for the AUTO-CONTINUE comment.
 fn apply_token_budget(mut lead_res: TeamLeaderResponse) -> TokenBudgetResult {
     if lead_res.files_to_read.len() <= MAX_FILES_PER_CYCLE {
         return TokenBudgetResult {
@@ -192,23 +158,12 @@ fn apply_token_budget(mut lead_res: TeamLeaderResponse) -> TokenBudgetResult {
     }
 }
 
-// ── stage 3: dev loop ─────────────────────────────────────────────────────────
-
 struct DevLoopResult {
     success: bool,
     branch_name: String,
     thought_process: String,
 }
 
-/// Run the developer → commit → review feedback loop for up to `max_attempts`.
-///
-/// On each attempt the workspace is reset to the branch HEAD so the developer
-/// always works from a clean baseline rather than layering on previous attempts.
-///
-/// The static context (repo tree + file contents) is passed via
-/// `ask_large_with_context` so that Anthropic's prompt cache covers the
-/// expensive file-reading portion.  Only the dynamic per-attempt feedback
-/// changes between retries, keeping cached token reuse high.
 async fn execute_dev_loop(
     config: &Config,
     prompts: &Prompts,
@@ -219,7 +174,6 @@ async fn execute_dev_loop(
 ) -> DevLoopResult {
     let max_attempts = 6;
     let mut feedback_history = String::new();
-    // Track consecutive JSON failures so we can vary the repair strategy
     let mut consecutive_json_failures: u32 = 0;
 
     let specific_files = if lead_res.chunks_to_read.is_empty() {
@@ -239,10 +193,6 @@ async fn execute_dev_loop(
     let semantic_outlines =
         file_system::read_semantic_outlines(config, lead_res.files_to_read.clone());
 
-    // ── Build the static context block ────────────────────────────────────────
-    // This portion is identical across all retry attempts for this issue, so it
-    // qualifies for prompt caching.  We assemble it once here and pass it as
-    // `static_context` to `ask_large_with_context` on every attempt.
     let static_context = format!(
         "Project: '{owner}/{repo}'.\n\
          \n\
@@ -259,17 +209,17 @@ async fn execute_dev_loop(
     );
 
     let dev_prompt = prompts.for_agent(&lead_res.assigned_agent);
+    let use_anthropic_cache = is_anthropic_endpoint(config);
+    let supports_tools = is_tool_calling_supported(config);
 
     for attempt in 1..=max_attempts {
         info!(attempt, max_attempts, agent = %lead_res.assigned_agent, "Developer writing code");
 
-        // Reset uncommitted changes — stay on the issue branch but wipe bad LLM code.
         if let Err(e) = git_local::reset_working_tree(config) {
             error!(err = %e, "Could not reset working tree before attempt");
             break;
         }
 
-        // The dynamic part changes on every attempt (attempt number + feedback).
         let dynamic_prompt = build_dynamic_dev_prompt(
             issue_text,
             lead_res,
@@ -278,15 +228,42 @@ async fn execute_dev_loop(
             max_attempts,
         );
 
-        // Use the large-token variant with the static context cached separately.
-        let raw = match llm_client::ask_large_with_context(
-            config,
-            dev_prompt,
-            &static_context,
-            &dynamic_prompt,
-        )
-        .await
-        {
+        let initial_user_content = if supports_tools && use_anthropic_cache {
+            build_user_content(&dynamic_prompt, Some(&static_context), true)
+        } else if supports_tools {
+            serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
+        } else {
+            serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
+        };
+
+        let mut conversation: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "role": "user", "content": initial_user_content }),
+        ];
+
+        let raw = if supports_tools {
+            run_dev_tool_loop(
+                config,
+                dev_prompt,
+                &mut conversation,
+                use_anthropic_cache,
+                attempt,
+            )
+            .await
+        } else {
+            match llm_client::ask_large_with_context(
+                config,
+                dev_prompt,
+                &static_context,
+                &dynamic_prompt,
+            )
+            .await
+            {
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        let raw = match raw {
             Ok(r) => r,
             Err(e) => {
                 error!(err = %e, "LLM request failed during dev loop");
@@ -299,7 +276,6 @@ async fn execute_dev_loop(
             }
         };
 
-        // ── JSON parse ────────────────────────────────────────────────────────
         let dev_res: DeveloperResponse = match serde_json::from_str(&raw) {
             Ok(r) => {
                 consecutive_json_failures = 0;
@@ -317,7 +293,6 @@ async fn execute_dev_loop(
                 };
 
                 feedback_history = if consecutive_json_failures >= 2 {
-                    // Escalate: give them a concrete skeleton to fill
                     format!(
                         "CRITICAL: Your response was invalid JSON for {} attempts in a row.\n\
                          serde error: '{}'\n\
@@ -347,8 +322,6 @@ async fn execute_dev_loop(
 
         info!(thought = %dev_res.thought_process, "Developer response parsed");
 
-        // ── Output completeness checks ─────────────────────────────────────────
-
         if dev_res.files_to_modify.is_empty() {
             warn!("Developer returned zero file modifications — retrying");
             feedback_history = format!(
@@ -360,7 +333,6 @@ async fn execute_dev_loop(
             continue;
         }
 
-        // Placeholder check — report which file triggered it
         if let Some((bad_file, bad_marker)) = find_placeholder(&dev_res) {
             warn!(file = %bad_file, marker = %bad_marker, "Placeholder detected — rejecting");
             feedback_history = format!(
@@ -374,7 +346,6 @@ async fn execute_dev_loop(
             continue;
         }
 
-        // ── Apply changes ──────────────────────────────────────────────────────
         if let Err(e) = file_system::apply_modifications(config, dev_res.files_to_modify.clone()) {
             warn!(err = %e, "Patch failed");
             feedback_history = format!(
@@ -382,13 +353,13 @@ async fn execute_dev_loop(
                  Instructions:\n\
                  - If using `target_chunk`: the name must EXACTLY match one from the 'Available chunks' list shown in SEMANTIC FILE OUTLINES.\n\
                  - If using `search_block`: copy the block CHARACTER-FOR-CHARACTER from the file content. Include 3+ lines of context.\n\
-                 - Do NOT invent chunk names or approximate search blocks.",
+                 - Do NOT invent chunk names or approximate search blocks.\n\
+                 - TIP: Use the `read_file` tool first to inspect the exact content of the file before writing your patch.",
                 e
             );
             continue;
         }
 
-        // ── Verify ─────────────────────────────────────────────────────────────
         if let Err(verify_err) = git_local::run_verification(config) {
             let is_relevant_error = dev_res.files_to_modify.iter().any(|m| {
                 let file_name = std::path::Path::new(&m.file_path)
@@ -403,8 +374,8 @@ async fn execute_dev_loop(
                 feedback_history = format!(
                     "CRITICAL VERIFICATION ERROR: Your code failed the build/linter.\n\
                      Fix ONLY the errors in the files you modified. Do not change anything else.\n\
-                     Error output:\n{}",
-                    truncate_to(verify_err, 2000)
+                     Diagnostic output:\n{}",
+                    verify_err
                 );
                 continue;
             } else {
@@ -415,7 +386,6 @@ async fn execute_dev_loop(
             }
         }
 
-        // ── Commit ─────────────────────────────────────────────────────────────
         let commit_msg = format!(
             "feat: Resolve issue #{} (attempt {})\n\n{}",
             branch_name.trim_start_matches("feature/issue-"),
@@ -424,7 +394,6 @@ async fn execute_dev_loop(
         );
         let _ = git_local::commit_changes(config, &commit_msg);
 
-        // ── Review ─────────────────────────────────────────────────────────────
         match review_code(config, prompts, issue_text, &lead_res.architectural_plan).await {
             Some(rev) if rev.is_approved => {
                 info!("Review approved on attempt {}", attempt);
@@ -461,10 +430,185 @@ async fn execute_dev_loop(
     }
 }
 
-/// Build the dynamic portion of the developer prompt that changes between attempts.
-///
-/// The static portion (repo tree, file contents) is passed separately as
-/// `static_context` so it can be prompt-cached and reused across retries.
+async fn run_dev_tool_loop(
+    config: &Config,
+    dev_prompt: &str,
+    conversation: &mut Vec<serde_json::Value>,
+    use_anthropic_cache: bool,
+    attempt: usize,
+) -> Result<String, String> {
+    let mut read_turns = 0usize;
+
+    loop {
+        let turn = llm_client::ask_dev_turn(
+            config,
+            dev_prompt,
+            conversation,
+            use_anthropic_cache,
+        )
+        .await;
+
+        match turn {
+            DevTurnResult::ApplyPatch(payload) => {
+                info!(attempt, "Agent called apply_patch");
+                return Ok(payload);
+            }
+
+            DevTurnResult::ReadFile { tool_use_id, file_path, start_line, end_line } => {
+                read_turns += 1;
+                if read_turns > MAX_READ_FILE_TURNS {
+                    return Err(format!(
+                        "Agent called read_file {} times without calling apply_patch. \
+                         You must call apply_patch to submit your changes.",
+                        read_turns
+                    ));
+                }
+
+                info!(
+                    attempt,
+                    read_turns,
+                    file = %file_path,
+                    start = ?start_line,
+                    end = ?end_line,
+                    "Agent is reading a file (Read-Before-Write)"
+                );
+
+                let file_content = serve_read_file(config, &file_path, start_line, end_line);
+
+                append_read_file_turn(
+                    conversation,
+                    &tool_use_id,
+                    &file_path,
+                    start_line,
+                    end_line,
+                    &file_content,
+                    use_anthropic_cache,
+                );
+            }
+
+            DevTurnResult::Error(e) => {
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn serve_read_file(
+    config: &Config,
+    file_path: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> String {
+    let full_path = config.workspace_dir.join(file_path);
+
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(e) => return format!("Error: could not read '{}': {}", file_path, e),
+    };
+
+    if start_line.is_none() && end_line.is_none() {
+        let numbered: String = content
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("{:>4}: {}\n", i + 1, l))
+            .collect();
+        return format!(
+            "File: {} ({} lines)\n\n{}",
+            file_path,
+            content.lines().count(),
+            numbered
+        );
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = start_line.map(|s| s.saturating_sub(1)).unwrap_or(0).min(total);
+    let end = end_line.map(|e| e.min(total)).unwrap_or(total);
+
+    if start >= end {
+        return format!(
+            "Error: invalid line range {}—{} for '{}' ({} lines total)",
+            start + 1, end, file_path, total
+        );
+    }
+
+    let numbered: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:>4}: {}\n", start + i + 1, l))
+        .collect();
+
+    format!(
+        "File: {} (lines {}—{} of {})\n\n{}",
+        file_path,
+        start + 1,
+        end,
+        total,
+        numbered
+    )
+}
+
+fn append_read_file_turn(
+    conversation: &mut Vec<serde_json::Value>,
+    tool_use_id: &str,
+    file_path: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    file_content: &str,
+    use_anthropic_format: bool,
+) {
+    let input = {
+        let mut m = serde_json::Map::new();
+        m.insert("file_path".to_string(), serde_json::json!(file_path));
+        if let Some(s) = start_line {
+            m.insert("start_line".to_string(), serde_json::json!(s));
+        }
+        if let Some(e) = end_line {
+            m.insert("end_line".to_string(), serde_json::json!(e));
+        }
+        serde_json::Value::Object(m)
+    };
+
+    if use_anthropic_format {
+        conversation.push(serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "read_file",
+                "input": input
+            }]
+        }));
+        conversation.push(serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": file_content
+            }]
+        }));
+    } else {
+        let args = serde_json::to_string(&input).unwrap_or_default();
+        conversation.push(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": tool_use_id,
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": args
+                }
+            }]
+        }));
+        conversation.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_use_id,
+            "content": file_content
+        }));
+    }
+}
+
 fn build_dynamic_dev_prompt(
     issue_text: &str,
     lead_res: &TeamLeaderResponse,
@@ -486,7 +630,13 @@ fn build_dynamic_dev_prompt(
          Issue: {issue}\n\
          Architectural Plan: {plan}\n\
          \n\
-         CRITICAL OUTPUT RULES:\n\
+         WORKFLOW:\n\
+         1. OPTIONAL: Call `read_file` one or more times to inspect any file before writing patches.\n\
+            - Use `read_file` when you need to verify exact indentation, surrounding context, or function signatures.\n\
+            - You may call it multiple times on different files or line ranges.\n\
+         2. REQUIRED: Call `apply_patch` once with ALL your file modifications.\n\
+         \n\
+         CRITICAL OUTPUT RULES (for apply_patch):\n\
          1. Output ONLY a raw JSON object — absolutely zero prose before or after.\n\
          2. The JSON MUST be 100%% complete and syntactically valid — never stop mid-object.\n\
          3. Inside JSON string values: \\n for newlines, \\\" for quotes, \\\\ for backslash.\n\
@@ -501,9 +651,6 @@ fn build_dynamic_dev_prompt(
     )
 }
 
-// ── stage 4: review ───────────────────────────────────────────────────────────
-
-/// Ask the reviewer to evaluate the current diff. Returns `None` on parse error.
 async fn review_code(
     config: &Config,
     prompts: &Prompts,
@@ -527,8 +674,6 @@ async fn review_code(
         });
     }
 
-    // Static context for the reviewer: plan + diff.  The diff changes every
-    // review call so there is no meaningful cache hit here; we use plain `ask`.
     let input = format!(
         "Original Issue: {}\nArchitectural Plan (Scope): {}\nDiff:\n{}",
         issue_text,
@@ -553,9 +698,6 @@ async fn review_code(
     }
 }
 
-// ── stage 5: deliver ──────────────────────────────────────────────────────────
-
-/// Push the approved branch and open a pull request. Returns the PR URL.
 async fn deliver_pr(
     config: &Config,
     issue_number: u64,
@@ -577,9 +719,6 @@ async fn deliver_pr(
     github::create_pull_request(config, &title, &body, branch_name, "main").await
 }
 
-// ── top-level per-issue workflow ──────────────────────────────────────────────
-
-/// Full workflow for a single issue. Returns `true` if a PR was opened.
 async fn process_issue(
     config: &Config,
     prompts: &Prompts,
@@ -603,18 +742,9 @@ async fn process_issue(
         issue.title, issue_body, comments
     );
 
-    // ── Build context strings ─────────────────────────────────────────────────
-    //
-    // repo_map  → compact symbol-signature map used by the Team Lead for planning.
-    //             Constant across all issues → excellent cache candidate.
-    //
-    // repo_tree → flat file-path listing used inside the developer prompt as a
-    //             quick reference.  Also static, but smaller than the map.
-    //
     let repo_map = file_system::get_repo_map(config);
     let repo_tree = file_system::get_repo_tree(config);
 
-    // ── Plan ──────────────────────────────────────────────────────────────────
     let lead_res = match plan_issue(config, prompts, &issue_text, &repo_map).await {
         Some(r) => r,
         None => {
@@ -630,14 +760,12 @@ async fn process_issue(
         "Plan ready"
     );
 
-    // ── Token budget ──────────────────────────────────────────────────────────
     let TokenBudgetResult {
         lead_res,
         remaining_files,
         was_truncated,
     } = apply_token_budget(lead_res);
 
-    // ── Dev loop ──────────────────────────────────────────────────────────────
     let result = execute_dev_loop(
         config,
         prompts,
@@ -654,9 +782,7 @@ async fn process_issue(
         return false;
     }
 
-    // AUTO-CONTINUE comment if we deferred files
     if was_truncated {
-        // Push the partial work to the remote branch so it's not lost
         let _ = git_local::push_to_remote(config, &branch_name);
 
         let comment = format!(
@@ -672,11 +798,9 @@ async fn process_issue(
             "AUTO-CONTINUE comment posted, branch saved"
         );
 
-        // Do not mark as fully processed — leave it for the next cycle
         return false;
     }
 
-    // ── Deliver PR ────────────────────────────────────────────────────────────
     match deliver_pr(
         config,
         issue.number,
@@ -693,23 +817,18 @@ async fn process_issue(
         }
     }
 
-    // Cleanup local branch
     git_local::delete_local_branch(config, &result.branch_name);
     let _ = git_local::reset_to_main(config);
 
     true
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Return the file path and triggering marker of the first file containing a
-/// known placeholder marker, or `None` if the submission looks complete.
 fn find_placeholder(dev_res: &DeveloperResponse) -> Option<(String, String)> {
     for file in &dev_res.files_to_modify {
         let sources = [
             file.replace_block.as_str(),
             file.new_content.as_str(),
-            file.target_chunk.as_str(), // paranoia
+            file.target_chunk.as_str(),
         ];
         for source in &sources {
             for marker in PLACEHOLDER_MARKERS {
@@ -722,8 +841,6 @@ fn find_placeholder(dev_res: &DeveloperResponse) -> Option<(String, String)> {
     None
 }
 
-/// Truncate a string to `max_chars` characters.
-/// Appends `…[TRUNCATED]` when cut so the model knows output was clipped.
 fn truncate_to<S: AsRef<str>>(s: S, max_chars: usize) -> String {
     let s = s.as_ref();
     if s.chars().count() <= max_chars {

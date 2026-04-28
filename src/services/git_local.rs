@@ -3,8 +3,6 @@ use tracing::{debug, info, warn};
 
 use crate::config::Config;
 
-/// Checkout a branch. If it exists locally or on the remote, it switches to it and pulls the latest.
-/// If it doesn't exist, it creates a fresh branch from main.
 pub fn setup_branch(config: &Config, branch_name: &str) -> Result<(), String> {
     let _ = run(config, &["fetch", "origin"]);
 
@@ -30,8 +28,6 @@ pub fn setup_branch(config: &Config, branch_name: &str) -> Result<(), String> {
     }
 }
 
-/// Stage all changes and commit with the given message.
-/// Succeeds silently when there is nothing to commit.
 pub fn commit_changes(config: &Config, message: &str) -> Result<(), String> {
     debug!("Staging and committing changes");
 
@@ -49,13 +45,11 @@ pub fn commit_changes(config: &Config, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Return the unified diff of the current branch against `main`.
 pub fn get_diff_against_main(config: &Config) -> Result<String, String> {
     let out = run(config, &["diff", "-U2", "main"])?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-/// Force-push the branch to `origin` using the tracked remote.
 pub fn push_to_remote(config: &Config, branch_name: &str) -> Result<(), String> {
     info!(branch = branch_name, "Pushing branch to remote");
 
@@ -69,7 +63,6 @@ pub fn push_to_remote(config: &Config, branch_name: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// Hard-reset and checkout main, then pull latest from origin.
 pub fn reset_to_main(config: &Config) -> Result<(), String> {
     info!("Resetting workspace to main branch");
 
@@ -86,13 +79,10 @@ pub fn reset_to_main(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete a local branch by name, ignoring errors (best-effort cleanup).
 pub fn delete_local_branch(config: &Config, branch_name: &str) {
     debug!(branch = branch_name, "Deleting local branch");
     let _ = run(config, &["branch", "-D", branch_name]);
 }
-
-// ── internal helpers ─────────────────────────────────────────────────────────
 
 fn run(config: &Config, args: &[&str]) -> Result<std::process::Output, String> {
     Command::new("git")
@@ -127,17 +117,191 @@ pub fn run_verification(config: &Config) -> Result<(), String> {
         .map_err(|e| format!("Failed to run verification command: {}", e))?;
 
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let combined = format!("STDOUT:\n{}\nSTDERR:\n{}", stdout, stderr);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let combined = format!("{}\n{}", stdout, stderr);
 
-        let err_str = if combined.len() > 2000 {
-            format!("...{}", &combined[combined.len() - 2000..])
-        } else {
-            combined
-        };
-        return Err(err_str);
+        let diagnostics = parse_diagnostics(&combined, &config.verify_command);
+        return Err(diagnostics);
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct Diagnostic {
+    file_path: String,
+    line: Option<u32>,
+    message: String,
+}
+
+const MAX_DIAGNOSTICS: usize = 10;
+
+fn parse_diagnostics(raw: &str, verify_command: &str) -> String {
+    let is_cargo = verify_command.contains("cargo");
+
+    let diagnostics = if is_cargo {
+        parse_cargo_diagnostics(raw)
+    } else {
+        parse_generic_diagnostics(raw)
+    };
+
+    if diagnostics.is_empty() {
+        let trimmed = raw.trim();
+        let snippet = if trimmed.len() > 1500 {
+            format!("…[truncated]\n{}", &trimmed[trimmed.len() - 1500..])
+        } else {
+            trimmed.to_string()
+        };
+        return format!("Verification failed. Raw output:\n{}", snippet);
+    }
+
+    let shown: Vec<&Diagnostic> = diagnostics.iter().take(MAX_DIAGNOSTICS).collect();
+    let total = diagnostics.len();
+    let omitted = total.saturating_sub(MAX_DIAGNOSTICS);
+
+    let mut out = format!(
+        "Verification failed — {} error(s) found{}:\n\n",
+        total,
+        if omitted > 0 { format!(" ({} shown)", shown.len()) } else { String::new() }
+    );
+
+    for d in &shown {
+        match d.line {
+            Some(l) => out.push_str(&format!("  {}:{} — {}\n", d.file_path, l, d.message)),
+            None    => out.push_str(&format!("  {} — {}\n", d.file_path, d.message)),
+        }
+    }
+
+    if omitted > 0 {
+        out.push_str(&format!(
+            "\n  … and {} more error(s) not shown. Fix the above first.\n",
+            omitted
+        ));
+    }
+
+    out.push_str("\nFix ONLY the errors in files you modified. Do not change unrelated code.");
+    out
+}
+
+fn parse_cargo_diagnostics(raw: &str) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    let lines: Vec<&str> = raw.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let line = lines[i].trim_start();
+
+        if (line.starts_with("error[") || line.starts_with("error:"))
+            && !line.contains("aborting due to")
+            && !line.contains("could not compile")
+            && !line.starts_with("error: cannot open")
+        {
+            let message = line
+                .trim_start_matches("error")
+                .trim_start_matches(|c: char| c == '[' || c.is_ascii_alphanumeric() || c == ']')
+                .trim_start_matches(':')
+                .trim()
+                .to_string();
+
+            let mut file_path = String::new();
+            let mut diag_line: Option<u32> = None;
+
+            for j in (i + 1)..(i + 6).min(lines.len()) {
+                let candidate = lines[j].trim();
+                if let Some(rest) = candidate.strip_prefix("-->") {
+                    let loc = rest.trim();
+                    let mut parts = loc.splitn(3, ':');
+                    if let Some(fp) = parts.next() {
+                        file_path = fp.trim().to_string();
+                    }
+                    if let Some(ln) = parts.next() {
+                        diag_line = ln.trim().parse::<u32>().ok();
+                    }
+                    break;
+                }
+            }
+
+            if !file_path.is_empty() {
+                diagnostics.push(Diagnostic {
+                    file_path,
+                    line: diag_line,
+                    message: if message.is_empty() { "error".to_string() } else { message },
+                });
+            }
+        }
+
+        i += 1;
+    }
+
+    diagnostics
+}
+
+fn parse_generic_diagnostics(raw: &str) -> Vec<Diagnostic> {
+    let mut diagnostics: Vec<Diagnostic> = Vec::new();
+
+    for line in raw.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty()
+            || trimmed.starts_with("Found ")
+            || trimmed.starts_with("npm ")
+            || trimmed.starts_with("warning")
+            || trimmed.starts_with("Warning")
+        {
+            continue;
+        }
+
+        if !trimmed.to_lowercase().contains("error") {
+            continue;
+        }
+
+        let parts: Vec<&str> = trimmed.splitn(4, ':').collect();
+        if parts.len() >= 3 {
+            let file_candidate = parts[0].trim();
+            let line_candidate = parts[1].trim();
+
+            let looks_like_path = file_candidate.contains('/')
+                || file_candidate.contains('.')
+                || file_candidate.starts_with("src")
+                || file_candidate.starts_with("lib")
+                || file_candidate.starts_with("tests");
+
+            if looks_like_path {
+                if let Ok(line_no) = line_candidate.parse::<u32>() {
+                    let raw_msg = parts[2..].join(":").trim().to_string();
+                    let message = {
+                        let segments: Vec<&str> = raw_msg.splitn(2, ':').collect();
+                        if segments.len() == 2 && segments[0].trim().parse::<u32>().is_ok() {
+                            segments[1].trim().to_string()
+                        } else {
+                            raw_msg
+                        }
+                    };
+
+                    diagnostics.push(Diagnostic {
+                        file_path: file_candidate.to_string(),
+                        line: Some(line_no),
+                        message,
+                    });
+                    continue;
+                }
+            }
+        }
+
+        if trimmed.len() < 200 {
+            diagnostics.push(Diagnostic {
+                file_path: String::new(),
+                line: None,
+                message: trimmed.to_string(),
+            });
+        }
+    }
+
+    let has_file_errors = diagnostics.iter().any(|d| !d.file_path.is_empty());
+    if has_file_errors {
+        diagnostics.retain(|d| !d.file_path.is_empty());
+    }
+
+    diagnostics
 }

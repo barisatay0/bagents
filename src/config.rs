@@ -1,8 +1,6 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Holds all validated configuration loaded once at startup.
-/// Avoids repeated `env::var` calls and panics scattered across services.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub github_token: String,
@@ -15,15 +13,11 @@ pub struct Config {
     pub llm_temperature: f32,
     pub json_mode: String,
     pub verify_command: String,
-    /// Max tokens for normal (planner / reviewer) requests.
     pub llm_max_tokens: u32,
-    /// Max tokens for developer agent requests that write full file content.
     pub llm_max_tokens_large: u32,
 }
 
 impl Config {
-    /// Load and validate all required environment variables.
-    /// Returns a descriptive error listing every missing key at once.
     pub fn from_env() -> Result<Self, String> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -61,9 +55,6 @@ impl Config {
         let json_mode = env::var("LLM_JSON_MODE").unwrap_or_else(|_| "openai".to_string());
         let verify_command = env::var("VERIFY_COMMAND").unwrap_or_default();
 
-        // Token limits — generous defaults so agents never silently truncate.
-        // Most frontier models support 8 192 – 32 768 output tokens.
-        // Override via .env if your provider has a lower ceiling.
         let llm_max_tokens = optional_u32!("LLM_MAX_TOKENS", 4096);
         let llm_max_tokens_large = optional_u32!("LLM_MAX_TOKENS_LARGE", 8192);
 
