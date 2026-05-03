@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
 
-use crate::clients::llm_client;
+use crate::clients::llm_client::{
+    self, DevTurnResult, build_user_content, is_anthropic_endpoint, is_tool_calling_supported,
+};
 use crate::config::Config;
 use crate::models::{
     developer_response::DeveloperResponse, reviewer_response::ReviewerResponse,
@@ -11,28 +13,15 @@ use crate::models::{
 use crate::prompts::Prompts;
 use crate::services::{file_system, git_local, github};
 
-/// Placeholder markers that indicate an agent submitted incomplete code.
 const PLACEHOLDER_MARKERS: &[&str] = &[
-    "// TODO",
-    "// FIXME",
-    "// HACK",
-    "// XXX",
-    "todo!()",
-    "unimplemented!()",
-    "... existing code ...",
-    "/* TODO */",
-    "# TODO",
-    "FIXME",
+    "// TODO", "// FIXME", "// HACK", "// XXX", "todo!()", "unimplemented!()",
+    "... existing code ...", "/* TODO */", "# TODO", "FIXME", "// ...",
+    "{/* ... */}", "// rest of", "// ... rest", "/* rest of",
 ];
 
-/// Maximum number of files passed to a developer agent per cycle.
-/// Keeping this at 1 protects the context window. Increase as models improve.
-const MAX_FILES_PER_CYCLE: usize = 1;
+const MAX_FILES_PER_CYCLE: usize = 2;
+const MAX_READ_FILE_TURNS: usize = 8;
 
-// ── entry point ──────────────────────────────────────────────────────────────
-
-/// Main factory loop. Polls GitHub for open issues, orchestrates agents,
-/// reviews code, and opens pull requests until interrupted.
 pub async fn run_factory(
     config: &Config,
     prompts: &Prompts,
@@ -71,7 +60,6 @@ pub async fn run_factory(
             "Processing issue"
         );
 
-        // Always start from a clean main branch
         if let Err(e) = git_local::reset_to_main(config) {
             error!(err = %e, "Could not reset to main — skipping issue");
             sleep(Duration::from_secs(10)).await;
@@ -94,21 +82,31 @@ pub async fn run_factory(
     }
 }
 
-// ── stage 1: plan ─────────────────────────────────────────────────────────────
-
-/// Ask the team lead to analyse the issue and produce an architectural plan.
-/// Returns `None` if the LLM returns unparseable JSON after logging the error.
 async fn plan_issue(
     config: &Config,
     prompts: &Prompts,
     issue_text: &str,
-    repo_tree: &str,
+    repo_map: &str,
 ) -> Option<TeamLeaderResponse> {
     info!("Team leader is planning...");
 
-    let input = format!("{}  Issue Context: {}", repo_tree, issue_text);
+    let user_prompt = format!(
+        "Issue to resolve:\n\
+         {issue_text}\n\n\
+         Use the REPOSITORY MAP above to identify which files need changing. \
+         Only request full file contents (files_to_read) for the files you are \
+         confident need modification — the map already shows you all available \
+         symbols and their signatures."
+    );
 
-    let raw = match llm_client::ask(config, &prompts.team_lead, &input).await {
+    let raw = match llm_client::ask_large_with_context(
+        config,
+        &prompts.team_lead,
+        repo_map,
+        &user_prompt,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             error!(err = %e, "LLM request failed during planning");
@@ -125,16 +123,12 @@ async fn plan_issue(
     }
 }
 
-// ── stage 2: token budget ─────────────────────────────────────────────────────
-
 struct TokenBudgetResult {
     lead_res: TeamLeaderResponse,
     remaining_files: Vec<String>,
     was_truncated: bool,
 }
 
-/// Enforce the per-cycle file limit. Injects a SYSTEM OVERRIDE into the
-/// architectural plan and records the spilled files for the AUTO-CONTINUE comment.
 fn apply_token_budget(mut lead_res: TeamLeaderResponse) -> TokenBudgetResult {
     if lead_res.files_to_read.len() <= MAX_FILES_PER_CYCLE {
         return TokenBudgetResult {
@@ -164,18 +158,12 @@ fn apply_token_budget(mut lead_res: TeamLeaderResponse) -> TokenBudgetResult {
     }
 }
 
-// ── stage 3: dev loop ─────────────────────────────────────────────────────────
-
 struct DevLoopResult {
     success: bool,
     branch_name: String,
     thought_process: String,
 }
 
-/// Run the developer → commit → review feedback loop for up to `max_attempts`.
-///
-/// On each attempt the workspace is reset to main first to ensure the developer
-/// always works from a clean baseline rather than layering on previous attempts.
 async fn execute_dev_loop(
     config: &Config,
     prompts: &Prompts,
@@ -184,8 +172,9 @@ async fn execute_dev_loop(
     lead_res: &TeamLeaderResponse,
     branch_name: &str,
 ) -> DevLoopResult {
-    let max_attempts = 5;
+    let max_attempts = 6;
     let mut feedback_history = String::new();
+    let mut consecutive_json_failures: u32 = 0;
 
     let specific_files = if lead_res.chunks_to_read.is_empty() {
         file_system::read_specific_files(config, lead_res.files_to_read.clone())
@@ -204,73 +193,168 @@ async fn execute_dev_loop(
     let semantic_outlines =
         file_system::read_semantic_outlines(config, lead_res.files_to_read.clone());
 
+    let static_context = format!(
+        "Project: '{owner}/{repo}'.\n\
+         \n\
+         {repo_tree}\n\
+         \n\
+         {semantic_outlines}\n\
+         \n\
+         {specific_files}",
+        owner = config.github_owner,
+        repo = config.github_repo,
+        repo_tree = repo_tree,
+        semantic_outlines = semantic_outlines,
+        specific_files = specific_files,
+    );
+
+    let dev_prompt = prompts.for_agent(&lead_res.assigned_agent);
+    let use_anthropic_cache = is_anthropic_endpoint(config);
+    let supports_tools = is_tool_calling_supported(config);
+
     for attempt in 1..=max_attempts {
         info!(attempt, max_attempts, agent = %lead_res.assigned_agent, "Developer writing code");
 
-        // Reset uncommitted changes instead of hard resetting to main.
-        // This ensures we stay on the current issue branch but wipe bad LLM code from previous attempts.
         if let Err(e) = git_local::reset_working_tree(config) {
             error!(err = %e, "Could not reset working tree before attempt");
             break;
         }
 
-        let dev_input = format!(
-            "Project Context: '{}/{}'.\n{}\n{}\n{}\nIssue: {}\nArchitectural Plan: {}\nREVIEWER FEEDBACK TO FIX: {}",
-            config.github_owner,
-            config.github_repo,
-            repo_tree,
-            semantic_outlines,
-            specific_files,
+        let dynamic_prompt = build_dynamic_dev_prompt(
             issue_text,
-            lead_res.architectural_plan,
-            feedback_history
+            lead_res,
+            &feedback_history,
+            attempt,
+            max_attempts,
         );
 
-        let dev_prompt = prompts.for_agent(&lead_res.assigned_agent);
+        let initial_user_content = if supports_tools && use_anthropic_cache {
+            build_user_content(&dynamic_prompt, Some(&static_context), true)
+        } else if supports_tools {
+            serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
+        } else {
+            serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
+        };
 
-        let raw = match llm_client::ask(config, dev_prompt, &dev_input).await {
+        let mut conversation: Vec<serde_json::Value> = vec![
+            serde_json::json!({ "role": "user", "content": initial_user_content }),
+        ];
+
+        let raw = if supports_tools {
+            run_dev_tool_loop(
+                config,
+                dev_prompt,
+                &mut conversation,
+                use_anthropic_cache,
+                attempt,
+            )
+            .await
+        } else {
+            match llm_client::ask_large_with_context(
+                config,
+                dev_prompt,
+                &static_context,
+                &dynamic_prompt,
+            )
+            .await
+            {
+                Ok(r) => Ok(r),
+                Err(e) => Err(e.to_string()),
+            }
+        };
+
+        let raw = match raw {
             Ok(r) => r,
             Err(e) => {
                 error!(err = %e, "LLM request failed during dev loop");
-                feedback_history = format!("SYSTEM ERROR: LLM request failed: {}", e);
+                feedback_history = format!(
+                    "SYSTEM ERROR: LLM request failed with: {}. \
+                     This was not your fault. On your next attempt, output a complete, valid JSON object.",
+                    e
+                );
                 continue;
             }
         };
 
         let dev_res: DeveloperResponse = match serde_json::from_str(&raw) {
-            Ok(r) => r,
+            Ok(r) => {
+                consecutive_json_failures = 0;
+                r
+            }
             Err(e) => {
-                warn!(err = %e, "Developer returned invalid JSON — retrying");
-                let snippet = raw.chars().take(300).collect::<String>();
-                feedback_history = format!(
-                    "CRITICAL: Your last response was NOT valid JSON. serde error: '{}'. \
-                     The response started with: {:?}. \
-                     Output ONLY a raw JSON object. No thinking text, no markdown, no prose before or after the {{}}.",
-                    e, snippet
-                );
+                consecutive_json_failures += 1;
+                warn!(err = %e, consecutive = consecutive_json_failures, "Developer returned invalid JSON — retrying");
+
+                let snippet = raw.chars().take(400).collect::<String>();
+                let tail = if raw.len() > 200 {
+                    raw.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>()
+                } else {
+                    String::new()
+                };
+
+                feedback_history = if consecutive_json_failures >= 2 {
+                    format!(
+                        "CRITICAL: Your response was invalid JSON for {} attempts in a row.\n\
+                         serde error: '{}'\n\
+                         Response start: {:?}\n\
+                         Response end: {:?}\n\
+                         YOU MUST output ONLY this exact structure (no prose, no markdown, no thinking text):\n\
+                         {{\"thought_process\":\"...\",\"branch_name\":\"feature/...\",\"files_to_modify\":[{{\"file_path\":\"src/...\",\"target_chunk\":\"...\",\"new_content\":\"...\"}}]}}",
+                        consecutive_json_failures, e, snippet, tail
+                    )
+                } else {
+                    format!(
+                        "CRITICAL: Your last response was NOT valid JSON.\n\
+                         serde error: '{}'\n\
+                         Your response started with: {:?}\n\
+                         Your response ended with: {:?}\n\
+                         Rules:\n\
+                         1. Output ONLY a raw JSON object — zero text before or after the {{}}.\n\
+                         2. Never use real newlines inside JSON string values — use \\n.\n\
+                         3. Never use unescaped quotes inside strings — use \\\".\n\
+                         4. The JSON must be COMPLETE — do not stop mid-object.",
+                        e, snippet, tail
+                    )
+                };
                 continue;
             }
         };
 
         info!(thought = %dev_res.thought_process, "Developer response parsed");
 
-        // Placeholder check — report which file triggered it
-        if let Some(bad_file) = find_placeholder(&dev_res) {
-            warn!(file = %bad_file, "Placeholder detected — rejecting");
+        if dev_res.files_to_modify.is_empty() {
+            warn!("Developer returned zero file modifications — retrying");
             feedback_history = format!(
-                "CRITICAL ERROR: File '{}' contains placeholder code (TODO/FIXME/unimplemented!/etc.). \
-                 Write the COMPLETE, production-ready implementation. Do not skip any logic.",
-                bad_file
+                "CRITICAL: Your response contained an empty `files_to_modify` array.\n\
+                 You MUST include at least one file modification.\n\
+                 The issue requires changes to: {:?}",
+                lead_res.files_to_read
             );
             continue;
         }
 
-        // Apply changes
+        if let Some((bad_file, bad_marker)) = find_placeholder(&dev_res) {
+            warn!(file = %bad_file, marker = %bad_marker, "Placeholder detected — rejecting");
+            feedback_history = format!(
+                "CRITICAL ERROR: File '{}' contains the placeholder '{}'. \
+                 Placeholders are STRICTLY FORBIDDEN. \
+                 You MUST write the COMPLETE, production-ready implementation. \
+                 Every function body, every field, every line of logic — fully written out. \
+                 Do not use shortcuts like '// ...', '// existing code', or '// TODO'.",
+                bad_file, bad_marker
+            );
+            continue;
+        }
+
         if let Err(e) = file_system::apply_modifications(config, dev_res.files_to_modify.clone()) {
             warn!(err = %e, "Patch failed");
             feedback_history = format!(
-                "CRITICAL ERROR: Failed to apply patch. The target_chunk or search_block did NOT match. \
-                 Error: {}",
+                "CRITICAL ERROR: Failed to apply your patch. Details:\n{}\n\n\
+                 Instructions:\n\
+                 - If using `target_chunk`: the name must EXACTLY match one from the 'Available chunks' list shown in SEMANTIC FILE OUTLINES.\n\
+                 - If using `search_block`: copy the block CHARACTER-FOR-CHARACTER from the file content. Include 3+ lines of context.\n\
+                 - Do NOT invent chunk names or approximate search blocks.\n\
+                 - TIP: Use the `read_file` tool first to inspect the exact content of the file before writing your patch.",
                 e
             );
             continue;
@@ -286,32 +370,33 @@ async fn execute_dev_loop(
             });
 
             if is_relevant_error {
-                warn!(
-                    attempt,
-                    "Verification failed on modified files, sending back to dev"
-                );
+                warn!(attempt, "Verification failed on modified files");
                 feedback_history = format!(
-                    "CRITICAL VERIFICATION ERROR: Your code failed the build/linter. \
-                                     Fix ONLY the errors in the files you modified. Error output:\n{}",
-                    truncate_to(verify_err, 1500)
+                    "CRITICAL VERIFICATION ERROR: Your code failed the build/linter.\n\
+                     Fix ONLY the errors in the files you modified. Do not change anything else.\n\
+                     Diagnostic output:\n{}",
+                    verify_err
                 );
                 continue;
             } else {
                 warn!(
                     attempt,
-                    "Verification failed, but errors are in OUT-OF-SCOPE files. Bypassing check."
+                    "Verification failed but errors are in out-of-scope files — bypassing"
                 );
             }
         }
-        // ───────────────────────────────────────────────────────────────────
 
-        let commit_msg = format!("feat: Resolve issue (attempt {})", attempt);
+        let commit_msg = format!(
+            "feat: Resolve issue #{} (attempt {})\n\n{}",
+            branch_name.trim_start_matches("feature/issue-"),
+            attempt,
+            truncate_to(&dev_res.thought_process, 500)
+        );
         let _ = git_local::commit_changes(config, &commit_msg);
 
-        // Review
         match review_code(config, prompts, issue_text, &lead_res.architectural_plan).await {
             Some(rev) if rev.is_approved => {
-                info!("Review approved");
+                info!("Review approved on attempt {}", attempt);
                 return DevLoopResult {
                     success: true,
                     branch_name: branch_name.to_string(),
@@ -319,21 +404,25 @@ async fn execute_dev_loop(
                 };
             }
             Some(rev) => {
-                feedback_history = truncate_to(rev.feedback_thread.unwrap_or_default(), 1500);
+                let fb = rev.feedback_thread.unwrap_or_default();
+                feedback_history = truncate_to(&fb, 2000);
                 warn!(feedback = %feedback_history, attempt, "Review rejected");
             }
             None => {
                 warn!(
                     attempt,
-                    "Reviewer returned unparseable JSON — treating as rejection"
+                    "Reviewer returned unparseable JSON — treating as soft rejection"
                 );
                 feedback_history =
-                    "The reviewer could not parse its own output. Please ensure your code is complete and correct.".to_string();
+                    "The reviewer could not parse its output. \
+                     This likely means the code diff looked incomplete. \
+                     Ensure your implementation is 100% complete with no placeholders or cut-off content."
+                        .to_string();
             }
         }
     }
 
-    warn!("Max attempts reached without approval");
+    warn!("Max attempts ({}) reached without approval", max_attempts);
     DevLoopResult {
         success: false,
         branch_name: String::new(),
@@ -341,9 +430,227 @@ async fn execute_dev_loop(
     }
 }
 
-// ── stage 4: review ───────────────────────────────────────────────────────────
+async fn run_dev_tool_loop(
+    config: &Config,
+    dev_prompt: &str,
+    conversation: &mut Vec<serde_json::Value>,
+    use_anthropic_cache: bool,
+    attempt: usize,
+) -> Result<String, String> {
+    let mut read_turns = 0usize;
 
-/// Ask the reviewer to evaluate the current diff. Returns `None` on parse error.
+    loop {
+        let turn = llm_client::ask_dev_turn(
+            config,
+            dev_prompt,
+            conversation,
+            use_anthropic_cache,
+        )
+        .await;
+
+        match turn {
+            DevTurnResult::ApplyPatch(payload) => {
+                info!(attempt, "Agent called apply_patch");
+                return Ok(payload);
+            }
+
+            DevTurnResult::ReadFile { tool_use_id, file_path, start_line, end_line } => {
+                read_turns += 1;
+                if read_turns > MAX_READ_FILE_TURNS {
+                    return Err(format!(
+                        "Agent called read_file {} times without calling apply_patch. \
+                         You must call apply_patch to submit your changes.",
+                        read_turns
+                    ));
+                }
+
+                info!(
+                    attempt,
+                    read_turns,
+                    file = %file_path,
+                    start = ?start_line,
+                    end = ?end_line,
+                    "Agent is reading a file (Read-Before-Write)"
+                );
+
+                let file_content = serve_read_file(config, &file_path, start_line, end_line);
+
+                append_read_file_turn(
+                    conversation,
+                    &tool_use_id,
+                    &file_path,
+                    start_line,
+                    end_line,
+                    &file_content,
+                    use_anthropic_cache,
+                );
+            }
+
+            DevTurnResult::Error(e) => {
+                return Err(e);
+            }
+        }
+    }
+}
+
+fn serve_read_file(
+    config: &Config,
+    file_path: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+) -> String {
+    let full_path = config.workspace_dir.join(file_path);
+
+    let content = match std::fs::read_to_string(&full_path) {
+        Ok(c) => c,
+        Err(e) => return format!("Error: could not read '{}': {}", file_path, e),
+    };
+
+    if start_line.is_none() && end_line.is_none() {
+        let numbered: String = content
+            .lines()
+            .enumerate()
+            .map(|(i, l)| format!("{:>4}: {}\n", i + 1, l))
+            .collect();
+        return format!(
+            "File: {} ({} lines)\n\n{}",
+            file_path,
+            content.lines().count(),
+            numbered
+        );
+    }
+
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = start_line.map(|s| s.saturating_sub(1)).unwrap_or(0).min(total);
+    let end = end_line.map(|e| e.min(total)).unwrap_or(total);
+
+    if start >= end {
+        return format!(
+            "Error: invalid line range {}—{} for '{}' ({} lines total)",
+            start + 1, end, file_path, total
+        );
+    }
+
+    let numbered: String = lines[start..end]
+        .iter()
+        .enumerate()
+        .map(|(i, l)| format!("{:>4}: {}\n", start + i + 1, l))
+        .collect();
+
+    format!(
+        "File: {} (lines {}—{} of {})\n\n{}",
+        file_path,
+        start + 1,
+        end,
+        total,
+        numbered
+    )
+}
+
+fn append_read_file_turn(
+    conversation: &mut Vec<serde_json::Value>,
+    tool_use_id: &str,
+    file_path: &str,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+    file_content: &str,
+    use_anthropic_format: bool,
+) {
+    let input = {
+        let mut m = serde_json::Map::new();
+        m.insert("file_path".to_string(), serde_json::json!(file_path));
+        if let Some(s) = start_line {
+            m.insert("start_line".to_string(), serde_json::json!(s));
+        }
+        if let Some(e) = end_line {
+            m.insert("end_line".to_string(), serde_json::json!(e));
+        }
+        serde_json::Value::Object(m)
+    };
+
+    if use_anthropic_format {
+        conversation.push(serde_json::json!({
+            "role": "assistant",
+            "content": [{
+                "type": "tool_use",
+                "id": tool_use_id,
+                "name": "read_file",
+                "input": input
+            }]
+        }));
+        conversation.push(serde_json::json!({
+            "role": "user",
+            "content": [{
+                "type": "tool_result",
+                "tool_use_id": tool_use_id,
+                "content": file_content
+            }]
+        }));
+    } else {
+        let args = serde_json::to_string(&input).unwrap_or_default();
+        conversation.push(serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [{
+                "id": tool_use_id,
+                "type": "function",
+                "function": {
+                    "name": "read_file",
+                    "arguments": args
+                }
+            }]
+        }));
+        conversation.push(serde_json::json!({
+            "role": "tool",
+            "tool_call_id": tool_use_id,
+            "content": file_content
+        }));
+    }
+}
+
+fn build_dynamic_dev_prompt(
+    issue_text: &str,
+    lead_res: &TeamLeaderResponse,
+    feedback_history: &str,
+    attempt: usize,
+    max_attempts: usize,
+) -> String {
+    let attempt_warning = if attempt > 1 {
+        format!(
+            "\n⚠️  ATTEMPT {}/{}: Previous attempt(s) failed. Study the REVIEWER FEEDBACK carefully.\n",
+            attempt, max_attempts
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "{attempt_warning}\
+         Issue: {issue}\n\
+         Architectural Plan: {plan}\n\
+         \n\
+         WORKFLOW:\n\
+         1. OPTIONAL: Call `read_file` one or more times to inspect any file before writing patches.\n\
+            - Use `read_file` when you need to verify exact indentation, surrounding context, or function signatures.\n\
+            - You may call it multiple times on different files or line ranges.\n\
+         2. REQUIRED: Call `apply_patch` once with ALL your file modifications.\n\
+         \n\
+         CRITICAL OUTPUT RULES (for apply_patch):\n\
+         1. Output ONLY a raw JSON object — absolutely zero prose before or after.\n\
+         2. The JSON MUST be 100%% complete and syntactically valid — never stop mid-object.\n\
+         3. Inside JSON string values: \\n for newlines, \\\" for quotes, \\\\ for backslash.\n\
+         4. new_content / replace_block MUST contain the ENTIRE implementation — no placeholders, no '// ...'.\n\
+         5. Never truncate. If a function is long, write every single line.\n\
+         \n\
+         REVIEWER FEEDBACK TO FIX: {feedback}",
+        attempt_warning = attempt_warning,
+        issue = issue_text,
+        plan = lead_res.architectural_plan,
+        feedback = feedback_history,
+    )
+}
+
 async fn review_code(
     config: &Config,
     prompts: &Prompts,
@@ -353,9 +660,25 @@ async fn review_code(
     info!("Reviewer analysing code...");
 
     let diff = git_local::get_diff_against_main(config).unwrap_or_default();
+
+    if diff.trim().is_empty() {
+        warn!("Diff is empty — no changes were committed, auto-rejecting");
+        return Some(ReviewerResponse {
+            thought_process: "Diff was empty — no code was changed.".to_string(),
+            is_approved: false,
+            feedback_thread: Some(
+                "CRITICAL: The diff was completely empty. \
+                 No files were modified. You must actually write code changes."
+                    .to_string(),
+            ),
+        });
+    }
+
     let input = format!(
         "Original Issue: {}\nArchitectural Plan (Scope): {}\nDiff:\n{}",
-        issue_text, architectural_plan, diff
+        issue_text,
+        architectural_plan,
+        truncate_to(diff, 12_000)
     );
 
     let raw = match llm_client::ask(config, &prompts.reviewer, &input).await {
@@ -375,9 +698,6 @@ async fn review_code(
     }
 }
 
-// ── stage 5: deliver ──────────────────────────────────────────────────────────
-
-/// Push the approved branch and open a pull request. Returns the PR URL.
 async fn deliver_pr(
     config: &Config,
     issue_number: u64,
@@ -386,18 +706,19 @@ async fn deliver_pr(
 ) -> Result<String, Box<dyn std::error::Error>> {
     git_local::push_to_remote(config, branch_name)?;
 
-    let title = format!("Resolve Issue #{} — Auto AI PR", issue_number);
+    let title = format!("fix: Resolve Issue #{} — AI Auto PR", issue_number);
     let body = format!(
-        "**Automated PR by AI Software Factory**\n\n**Agent thought process:** {}\n\nCloses #{}",
-        thought_process, issue_number
+        "## Automated PR by BAGENTS\n\n\
+         **Closes:** #{}\n\n\
+         **Agent thought process:**\n{}\n\n\
+         ---\n\
+         *Generated by BAGENTS — the autonomous AI software factory.*",
+        issue_number, thought_process
     );
 
     github::create_pull_request(config, &title, &body, branch_name, "main").await
 }
 
-// ── top-level per-issue workflow ──────────────────────────────────────────────
-
-/// Full workflow for a single issue. Returns `true` if a PR was opened.
 async fn process_issue(
     config: &Config,
     prompts: &Prompts,
@@ -421,10 +742,10 @@ async fn process_issue(
         issue.title, issue_body, comments
     );
 
+    let repo_map = file_system::get_repo_map(config);
     let repo_tree = file_system::get_repo_tree(config);
 
-    // Plan
-    let lead_res = match plan_issue(config, prompts, &issue_text, &repo_tree).await {
+    let lead_res = match plan_issue(config, prompts, &issue_text, &repo_map).await {
         Some(r) => r,
         None => {
             error!(issue = issue.number, "Planning failed — skipping issue");
@@ -439,14 +760,12 @@ async fn process_issue(
         "Plan ready"
     );
 
-    // Token budget
     let TokenBudgetResult {
         lead_res,
         remaining_files,
         was_truncated,
     } = apply_token_budget(lead_res);
 
-    // Dev loop
     let result = execute_dev_loop(
         config,
         prompts,
@@ -463,15 +782,13 @@ async fn process_issue(
         return false;
     }
 
-    // AUTO-CONTINUE comment if we deferred files
     if was_truncated {
-        // Push the partial work to the remote branch so it's not lost
         let _ = git_local::push_to_remote(config, &branch_name);
 
         let comment = format!(
             "**[AUTO-CONTINUE] Partial completion**\n\n\
-             Successfully updated: `{:?}`.\n\n\
-             Still to process (next cycle): `{:?}`.\n\n\
+             ✅ Successfully updated: `{:?}`\n\n\
+             ⏳ Still to process (next cycle): `{:?}`\n\n\
              *Picking this up automatically in the next cycle.*",
             lead_res.files_to_read, remaining_files
         );
@@ -481,12 +798,9 @@ async fn process_issue(
             "AUTO-CONTINUE comment posted, branch saved"
         );
 
-        // Do not mark as fully processed — leave it for the next cycle
-        // We also don't open a PR yet, and we don't delete the local branch.
         return false;
     }
 
-    // Deliver PR (Only executes if was_truncated is false, meaning the entire job is done)
     match deliver_pr(
         config,
         issue.number,
@@ -503,30 +817,30 @@ async fn process_issue(
         }
     }
 
-    // Cleanup local branch
     git_local::delete_local_branch(config, &result.branch_name);
     let _ = git_local::reset_to_main(config);
 
     true
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Return the file path of the first file containing a known placeholder marker,
-/// or `None` if the submission looks complete.
-fn find_placeholder(dev_res: &DeveloperResponse) -> Option<String> {
+fn find_placeholder(dev_res: &DeveloperResponse) -> Option<(String, String)> {
     for file in &dev_res.files_to_modify {
-        for marker in PLACEHOLDER_MARKERS {
-            if file.replace_block.contains(marker) || file.new_content.contains(marker) {
-                return Some(file.file_path.clone());
+        let sources = [
+            file.replace_block.as_str(),
+            file.new_content.as_str(),
+            file.target_chunk.as_str(),
+        ];
+        for source in &sources {
+            for marker in PLACEHOLDER_MARKERS {
+                if source.contains(marker) {
+                    return Some((file.file_path.clone(), marker.to_string()));
+                }
             }
         }
     }
     None
 }
-/// Truncate a string to `max_chars` characters.
-/// Appends `…[TRUNCATED]` when cut so the model knows output was clipped.
-/// Keeps `feedback_history` token-bounded across retry attempts.
+
 fn truncate_to<S: AsRef<str>>(s: S, max_chars: usize) -> String {
     let s = s.as_ref();
     if s.chars().count() <= max_chars {

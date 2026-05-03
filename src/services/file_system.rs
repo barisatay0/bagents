@@ -5,12 +5,56 @@ use tracing::{debug, info, warn};
 use crate::config::Config;
 use crate::models::file_modification::FileModification;
 
-/// Apply a list of file modifications to the workspace.
-///
-/// Each file's content is normalized: literal `\n`, `\t`, and `\"` escape
-/// sequences produced by LLMs are always expanded into real characters.
-/// The guard condition used previously (`!contains('\n')`) was fragile and
-/// caused silent failures — normalization is now unconditional.
+pub fn get_repo_map(config: &Config) -> String {
+    let mut file_paths: Vec<String> = Vec::new();
+    collect_paths(&config.workspace_dir, &config.workspace_dir, &mut file_paths);
+    file_paths.sort();
+
+    let mut out = String::from("REPOSITORY MAP (file paths + symbol signatures):\n\n");
+
+    for rel_path in &file_paths {
+        let full_path = config.workspace_dir.join(rel_path);
+
+        let source = match fs::read_to_string(&full_path) {
+            Ok(s) if s.len() <= 100_000 => s,
+            Ok(_) => {
+                out.push_str(&format!("{}  [too large — skipped]\n", rel_path));
+                continue;
+            }
+            Err(_) => {
+                out.push_str(&format!("{}\n", rel_path));
+                continue;
+            }
+        };
+
+        let signatures =
+            crate::services::semantic::extract_signatures(rel_path, &source);
+
+        if signatures.is_empty() {
+            out.push_str(&format!("{}\n", rel_path));
+        } else {
+            out.push_str(
+                &crate::services::semantic::format_file_signatures(rel_path, &signatures),
+            );
+            out.push('\n');
+        }
+    }
+
+    out
+}
+
+pub fn get_repo_tree(config: &Config) -> String {
+    let mut paths: Vec<String> = Vec::new();
+    collect_paths(&config.workspace_dir, &config.workspace_dir, &mut paths);
+    paths.sort();
+
+    let mut out = String::from("REPOSITORY STRUCTURE (DIRECTORY TREE):\n");
+    for p in &paths {
+        out.push_str(&format!("  - {}\n", p));
+    }
+    out
+}
+
 pub fn apply_modifications(
     config: &Config,
     modifications: Vec<FileModification>,
@@ -55,24 +99,38 @@ pub fn apply_modifications(
                 return Err(format!(
                     "CRITICAL: Semantic chunk '{}' not found in '{}'. Available chunks are: {:?}. \
                      If you are trying to ADD a completely new function, do NOT use target_chunk. \
-                     Instead, use search_block to find the location and insert your new code there.",
+                     Instead, use search_replace_blocks or search_block to find the location and insert your new code there.",
                     modif.target_chunk, modif.file_path, available_chunks
                 ));
             }
         }
 
-        // ── 2. Full-file mode (Sadece küçük ve yeni dosyalar için) ──
-        if !modif.new_content.is_empty() && modif.search_block.is_empty() {
+        if !modif.new_content.is_empty() && modif.search_block.is_empty() && modif.search_replace_blocks.is_empty() {
             let content = unescape_llm_output(&modif.new_content);
             fs::write(&full_path, &content).map_err(|e| e.to_string())?;
             info!(path = %modif.file_path, "File written (full-rewrite mode)");
             continue;
         }
 
-        // ── Patch mode ────────────────────────────────────────────────────
+        if !modif.search_replace_blocks.is_empty() {
+            let mut current = existing.clone();
+            for (i, pair) in modif.search_replace_blocks.iter().enumerate() {
+                let search = unescape_llm_output(&pair.search);
+                let replace = unescape_llm_output(&pair.replace);
+                current = apply_one_search_replace(&modif.file_path, &current, &search, &replace, i)?;
+            }
+            fs::write(&full_path, current).map_err(|e| e.to_string())?;
+            info!(
+                path = %modif.file_path,
+                count = modif.search_replace_blocks.len(),
+                "Patch applied (search_replace_blocks)"
+            );
+            continue;
+        }
+
         if modif.search_block.is_empty() {
             return Err(format!(
-                "FileModification for '{}' must use target_chunk, new_content, or search_block.",
+                "FileModification for '{}' must use target_chunk, new_content, search_replace_blocks, or search_block.",
                 modif.file_path
             ));
         }
@@ -80,7 +138,6 @@ pub fn apply_modifications(
         let search = unescape_llm_output(&modif.search_block);
         let replace = unescape_llm_output(&modif.replace_block);
 
-        // 1. Exact match
         if existing.contains(&search) {
             let patched = existing.replacen(&search, &replace, 1);
             fs::write(&full_path, patched).map_err(|e| e.to_string())?;
@@ -88,7 +145,6 @@ pub fn apply_modifications(
             continue;
         }
 
-        // 2. CRLF-normalised fallback — file might have \r\n from Windows checkout
         let existing_norm = existing.replace("\r\n", "\n");
         let search_norm = search.replace("\r\n", "\n");
         if existing_norm.contains(&search_norm) {
@@ -98,7 +154,6 @@ pub fn apply_modifications(
             continue;
         }
 
-        // 3. Trim-each-line fallback — handles leading/trailing whitespace drift
         let trim_lines =
             |s: &str| -> String { s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n") };
         let existing_trim = trim_lines(&existing_norm);
@@ -110,7 +165,6 @@ pub fn apply_modifications(
             continue;
         }
 
-        // 4. THE MAGIC BULLET: Whitespace-agnostic fuzzy match
         if let Some((start_idx, end_idx)) = find_fuzzy_match_range(&existing, &search) {
             let patched = format!(
                 "{}{}{}",
@@ -131,6 +185,39 @@ pub fn apply_modifications(
         ));
     }
     Ok(())
+}
+
+fn apply_one_search_replace(
+    file_path: &str,
+    content: &str,
+    search: &str,
+    replace: &str,
+    index: usize,
+) -> Result<String, String> {
+    if content.contains(search) {
+        return Ok(content.replacen(search, replace, 1));
+    }
+    let content_norm = content.replace("\r\n", "\n");
+    let search_norm = search.replace("\r\n", "\n");
+    if content_norm.contains(&search_norm) {
+        return Ok(content_norm.replacen(&search_norm, replace, 1));
+    }
+    let trim = |s: &str| s.lines().map(str::trim_end).collect::<Vec<_>>().join("\n");
+    let content_trim = trim(&content_norm);
+    let search_trim = trim(&search_norm);
+    if content_trim.contains(&search_trim) {
+        return Ok(content_trim.replacen(&search_trim, replace, 1));
+    }
+    if let Some((start, end)) = find_fuzzy_match_range(content, search) {
+        return Ok(format!("{}{}{}", &content[..start], replace, &content[end..]));
+    }
+    Err(format!(
+        "search_replace_blocks[{}]: search block not found in '{}' after exact, CRLF, trim, and fuzzy matching.\n\
+         First 120 chars of search: {:?}",
+        index,
+        file_path,
+        &search.chars().take(120).collect::<String>()
+    ))
 }
 
 fn find_fuzzy_match_range(existing: &str, search: &str) -> Option<(usize, usize)> {
@@ -168,21 +255,6 @@ fn find_fuzzy_match_range(existing: &str, search: &str) -> Option<(usize, usize)
     None
 }
 
-/// Build a formatted string listing every non-hidden, non-build file in the workspace.
-pub fn get_repo_tree(config: &Config) -> String {
-    let mut paths: Vec<String> = Vec::new();
-    collect_paths(&config.workspace_dir, &config.workspace_dir, &mut paths);
-    paths.sort();
-
-    let mut out = String::from("REPOSITORY STRUCTURE (DIRECTORY TREE):\n");
-    for p in &paths {
-        out.push_str(&format!("  - {}\n", p));
-    }
-    out
-}
-
-/// Read a list of relative file paths from the workspace and return their contents.
-/// Files larger than 15 000 bytes are skipped with a notice.
 pub fn read_specific_files(config: &Config, files: Vec<String>) -> String {
     let mut out = String::from("REQUESTED FILE CONTENTS:\n");
 
@@ -266,14 +338,6 @@ pub fn read_specific_chunks(config: &Config, file_path: &str, chunk_names: Vec<S
     out
 }
 
-// ── internal helpers ─────────────────────────────────────────────────────────
-
-/// Expand JSON-style escape sequences that LLMs commonly emit in string fields.
-///
-/// This is always applied — the previous conditional check on `contains('\n')`
-/// was unreliable because a file with a real newline early in the content (e.g.
-/// a blank comment line) would pass the guard and leave literal `\n` sequences
-/// in the written file.
 fn unescape_llm_output(s: &str) -> String {
     s.replace("\\n", "\n")
         .replace("\\t", "\t")
@@ -288,7 +352,6 @@ fn collect_paths(dir: &Path, workspace: &Path, paths: &mut Vec<String>) {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
 
-        // Skip hidden files, build artifacts, and massive lock files
         if name.starts_with('.')
             || name.ends_with(".lock")
             || name == "node_modules"
@@ -310,24 +373,5 @@ fn collect_paths(dir: &Path, workspace: &Path, paths: &mut Vec<String>) {
                 .to_string();
             paths.push(rel);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn unescape_always_runs() {
-        // Even if the string already has a real newline early on,
-        // remaining literal \n sequences are still expanded.
-        let input = "line1\nstill has \\n literal and \\t tab and \\\" quote";
-        let out = unescape_llm_output(input);
-        assert!(out.contains('\n'));
-        assert!(out.contains('\t'));
-        assert!(out.contains('"'));
-        assert!(!out.contains("\\n"));
-        assert!(!out.contains("\\t"));
-        assert!(!out.contains("\\\""));
     }
 }

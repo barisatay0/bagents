@@ -1,8 +1,6 @@
 use std::env;
 use std::path::PathBuf;
 
-/// Holds all validated configuration loaded once at startup.
-/// Avoids repeated `env::var` calls and panics scattered across services.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub github_token: String,
@@ -15,11 +13,11 @@ pub struct Config {
     pub llm_temperature: f32,
     pub json_mode: String,
     pub verify_command: String,
+    pub llm_max_tokens: u32,
+    pub llm_max_tokens_large: u32,
 }
 
 impl Config {
-    /// Load and validate all required environment variables.
-    /// Returns a descriptive error listing every missing key at once.
     pub fn from_env() -> Result<Self, String> {
         let mut errors: Vec<String> = Vec::new();
 
@@ -29,6 +27,15 @@ impl Config {
                     errors.push(format!("  - {} is missing", $key));
                     String::new()
                 })
+            };
+        }
+
+        macro_rules! optional_u32 {
+            ($key:expr, $default:expr) => {
+                env::var($key)
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                    .unwrap_or($default)
             };
         }
 
@@ -46,8 +53,10 @@ impl Config {
             .unwrap_or(0.2);
 
         let json_mode = env::var("LLM_JSON_MODE").unwrap_or_else(|_| "openai".to_string());
-
         let verify_command = env::var("VERIFY_COMMAND").unwrap_or_default();
+
+        let llm_max_tokens = optional_u32!("LLM_MAX_TOKENS", 4096);
+        let llm_max_tokens_large = optional_u32!("LLM_MAX_TOKENS_LARGE", 8192);
 
         if !errors.is_empty() {
             return Err(format!(
@@ -75,6 +84,8 @@ impl Config {
             llm_temperature,
             json_mode,
             verify_command,
+            llm_max_tokens,
+            llm_max_tokens_large,
         })
     }
 }
