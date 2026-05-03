@@ -1,4 +1,4 @@
-# BAGENTS: Autonomous AI Software Engineer
+# BAGENTS: Autonomous AI Software Engineer!
 
 BAGENTS is an autonomous, multi-agent AI coding framework built in Rust. It functions as an automated software engineer that monitors your GitHub repositories for open issues, writes the necessary code to resolve them, verifies the changes, and automatically opens a Pull Request — without human intervention.
 
@@ -153,7 +153,6 @@ The middleware should:
 ```
 
 The more specific your issue description, the better the output. Include file paths, function names, and expected behaviour where possible.
-
 BAGENTS will automatically detect the issue and begin processing within a minute.
 
 ---
