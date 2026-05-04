@@ -1,4 +1,4 @@
-# BAGENTS: Autonomous AI Software Engineer
+# BAGENTS: AI Software Team
 
 BAGENTS is an autonomous, multi-agent AI coding framework built in Rust. It functions as an automated software engineer that monitors your GitHub repositories for open issues, writes the necessary code to resolve them, verifies the changes, and automatically opens a Pull Request — without human intervention.
 
@@ -183,3 +183,40 @@ orchestrator
 | `reviewer.md` | Reviewer | Validates the git diff, approves or rejects |
 
 All prompts can be edited without recompiling. The system re-reads them at startup.
+
+# Building a Full Project with BAGENTS
+
+BAGENTS is a highly capable coding engine, but it is not a "one-click project generator." It operates exactly like a team of Senior Developers waiting for well-defined tasks. To build an entire application from scratch, you must step into the role of the Product Manager and Architect.
+Here is the recommended workflow for building a complete, complex application:
+
+1. Bootstrap the Repository (Human)
+
+Do not ask BAGENTS to initialize a project from nothing. Run your framework's initialization commands (e.g., cargo new, npx create-next-app, npm init) yourself, set up your base directory structure, and push the initial commit to main.
+
+2. Write Atomic, Focused Issues (Human)
+
+To ensure high-quality code, prevent hallucinations, and respect token budgets, BAGENTS limits the number of files it modifies per cycle. Break your project down into small, logical features.
+
+- Bad : "Build a complete e-commerce backend with payment integration."
+
+- Good : "Create the Prisma schema for the User model and implement the JWT authentication middleware in src/auth.ts."
+
+3. Provide Clear Technical Direction (Human)
+
+BAGENTS is smart, but it cannot read your mind. The more specific your issue, the better the result.
+
+- Mention exact file paths you want modified
+- Specify which libraries or design patterns to use.
+- If you have specific business logic, outline it in bullet points.
+
+4. Sequential Execution (BAGENTS)
+
+Build your project step-by-step. Let BAGENTS process an issue, review its Pull Request, and merge it into main before creating the next dependent issue. This ensures BAGENTS always reads the most up-to-date, working codebase.
+
+### Example Progression: 
+
+1. Issue #1: "Set up the database connection pool in src/db.rs" ➔ Merge PR
+2. Issue #2: "Create the User struct and implement CRUD operations" ➔ Merge PR
+3. Issue #3: "Add a REST endpoint for user registration using axum" ➔ Merge PR
+
+By treating BAGENTS as a collaborative engineering team rather than a magic wand, you can incrementally build massive, production-ready systems without writing the boilerplate yourself.
