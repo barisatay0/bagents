@@ -29,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     println!("========================================");
-    println!("BAGENTS: Autonomous Software Factory");
+    println!("BAGENTS: AI Software Team");
     println!("========================================\n");
 
     // Validate all config and prompt files at startup — fail fast with
