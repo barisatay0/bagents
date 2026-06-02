@@ -10,6 +10,44 @@ Engineered with systems design principles, BAGENTS mitigates common LLM integrat
 
 ---
 
+## Example Output
+
+```
+2026-06-02T07:27:10.100Z  INFO bagents: Configuration loaded owner="acme-corp" repo="core-api" workspace="/tmp/core-api" model="claude-3-5-sonnet-20241022"
+2026-06-02T07:27:10.102Z  INFO bagents::orchestrator: Factory started — polling for issues continuously
+2026-06-02T07:27:10.105Z  INFO bagents::orchestrator: Checking GitHub for open issues...
+2026-06-02T07:27:11.450Z  INFO bagents::orchestrator: Processing issue issue=42 title="Fix out of bounds panic in config parser"
+2026-06-02T07:27:11.500Z  INFO bagents::git_local: Resetting workspace to main branch
+2026-06-02T07:27:12.100Z  INFO bagents::git_local: Creating new branch branch="feature/issue-42"
+2026-06-02T07:27:12.305Z  INFO bagents::orchestrator: Team leader is planning...
+2026-06-02T07:27:18.900Z  INFO bagents::orchestrator: Plan ready agent="backend_dev" plan="The issue indicates a panic on line 84 when splitting the configuration string. We need to check if the split iterator yields a second item before accessing it. I will assign backend_dev to modify src/parser/config.rs." files=["src/parser/config.rs"]
+2026-06-02T07:27:18.905Z  INFO bagents::orchestrator: Developer writing code attempt=1 max_attempts=6 agent="backend_dev"
+2026-06-02T07:27:23.100Z  INFO bagents::clients::llm_client: Agent is reading a file (Read-Before-Write) attempt=1 read_turns=1 file="src/parser/config.rs" start=70 end=90
+2026-06-02T07:27:28.450Z  INFO bagents::clients::llm_client: Agent called apply_patch attempt=1
+2026-06-02T07:27:28.452Z  INFO bagents::orchestrator: Developer response parsed thought="I have added a length check before accessing index 1 of the parts array."
+2026-06-02T07:27:28.460Z  INFO bagents::services::file_system: Patch applied (search_replace_blocks) path="src/parser/config.rs" count=1
+2026-06-02T07:27:28.465Z  INFO bagents::git_local: Running verification command: cargo check
+2026-06-02T07:27:31.200Z  WARN bagents::orchestrator: Verification failed on modified files attempt=1
+2026-06-02T07:27:31.205Z  WARN bagents::orchestrator: Feedback applied: CRITICAL VERIFICATION ERROR: Your code failed the build/linter.
+Diagnostic output:
+Verification failed — 1 error(s) found:
+
+  src/parser/config.rs:85 — cannot move out of index of `Vec<&str>`
+
+Fix ONLY the errors in files you modified. Do not change unrelated code.
+2026-06-02T07:27:31.210Z  INFO bagents::orchestrator: Developer writing code attempt=2 max_attempts=6 agent="backend_dev"
+2026-06-02T07:27:40.500Z  INFO bagents::clients::llm_client: Agent called apply_patch attempt=2
+2026-06-02T07:27:40.505Z  INFO bagents::orchestrator: Developer response parsed thought="Ah, I attempted to move the string slice out of the Vec instead of copying/referencing it. I will fix the syntax to use .get(1) and handle the Option."
+2026-06-02T07:27:40.510Z  INFO bagents::services::file_system: Patch applied (search_replace_blocks) path="src/parser/config.rs" count=1
+2026-06-02T07:27:40.515Z  INFO bagents::git_local: Running verification command: cargo check
+2026-06-02T07:27:42.800Z  INFO bagents::orchestrator: Reviewer analysing code...
+2026-06-02T07:27:47.300Z  INFO bagents::orchestrator: Review approved on attempt 2
+2026-06-02T07:27:47.350Z  INFO bagents::git_local: Pushing branch to remote branch="feature/issue-42"
+2026-06-02T07:27:49.100Z  INFO bagents::github: Pull request created url="https://github.com/acme-corp/core-api/pull/43"
+2026-06-02T07:27:49.105Z  INFO bagents::orchestrator: Issue completed successfully issue=42
+2026-06-02T07:27:59.110Z  INFO bagents::orchestrator: Checking GitHub for open issues...
+2026-06-02T07:28:00.120Z  INFO bagents::orchestrator: No new issues — resting for 30s
+```
 ## Core Architecture
 
 ### Multi-Agent State Machine
@@ -61,12 +99,10 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
 
 ### Initialization
 
-1. Clone the repository and compile the binary:
+1. Clone the repository:
 ```bash
-   git clone [https://github.com/yourusername/bagents.git](https://github.com/yourusername/bagents.git)
+   git clone git@github.com:barisatay0/bagents.git
    cd bagents
-   cargo build --release
-
 ```
 
 2. Establish the environment configuration (`.env`):
