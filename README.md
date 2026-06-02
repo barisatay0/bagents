@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/images/logo.png" alt="Bagents Logo" width="200" />
+</p>
+
 # BAGENTS
 
 BAGENTS is an autonomous, end-to-end software engineering orchestration engine built in Rust. Operating as a specialized multi-agent system, it continuously monitors issue trackers, formulates architectural implementation plans, executes targeted codebase mutations, enforces deterministic verification, and orchestrates peer reviews before delivering production-ready Pull Requests.
