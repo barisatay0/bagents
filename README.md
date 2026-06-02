@@ -1,222 +1,109 @@
-# BAGENTS: AI Software Team
+# BAGENTS
 
-BAGENTS is an autonomous, multi-agent AI coding framework built in Rust. It functions as an automated software engineer that monitors your GitHub repositories for open issues, writes the necessary code to resolve them, verifies the changes, and automatically opens a Pull Request — without human intervention.
+BAGENTS is an autonomous, end-to-end software engineering orchestration engine built in Rust. Operating as a specialized multi-agent system, it continuously monitors issue trackers, formulates architectural implementation plans, executes targeted codebase mutations, enforces deterministic verification, and orchestrates peer reviews before delivering production-ready Pull Requests.
 
-Instead of operating as a simple chat assistant, BAGENTS uses a multi-agent architecture and semantic code understanding to safely modify large codebases.
-
----
-
-## How It Works
-
-The system operates in a continuous, multi-stage workflow:
-
-### 1. Ingestion
-Polls your target GitHub repository for the latest open issues.
-
-### 2. Planning
-A Team Lead agent analyzes the issue, reads the relevant repository structure, and generates an architectural plan — assigning the task to a specialized developer agent (Backend, Frontend, or DevOps).
-
-### 3. Execution
-The Developer agent writes the code. The system uses Tree-sitter for semantic chunking, allowing the agent to target and replace specific functions or structs without breaking the rest of the file.
-
-### 4. Verification
-The system runs your project's local test or build command (e.g. `cargo check`, `npm test`). If it fails, the error output is fed back to the agent for self-correction.
-
-### 5. Review
-A Code Reviewer agent analyzes the git diff. If the code is rejected, the workflow loops back to the developer with feedback.
-
-### 6. Delivery
-Once approved, the system commits the changes, pushes the branch via SSH, and opens a Pull Request on GitHub.
+Engineered with systems design principles, BAGENTS mitigates common LLM integration pitfalls—such as context window pollution and output hallucination—through rigorous Abstract Syntax Tree (AST) parsing, state-driven feedback loops, and robust fault-tolerance mechanisms.
 
 ---
 
-BAGENTS is LLM-agnostic and works with any OpenAI-compatible API, including Groq, local Ollama instances, and standard OpenAI models.
+## Core Architecture
+
+### Multi-Agent State Machine
+BAGENTS decouples the engineering lifecycle into discrete, specialized agent roles, reducing cognitive load on the LLM and ensuring clear separation of concerns:
+*   **Team Lead (Planner):** Ingests the issue and the repository map. Responsible for architectural scoping, identifying dependency chains, and selecting the exact files and semantic chunks required for the mutation.
+*   **Developer (Executor):** Operates strictly on the scoped files. Utilizes specific tool calls (`read_file`, `apply_patch`) to perform surgical edits, circumventing the need to rewrite entire files.
+*   **Reviewer (Gatekeeper):** Performs a static analysis of the generated `git diff` against the initial architectural plan. Rejects substandard implementations with actionable feedback, forcing a remediation cycle.
+
+### Semantic AST Parsing (Tree-sitter)
+To optimize token utilization and prevent context degradation, BAGENTS employs Tree-sitter for semantic code chunking across multiple languages (Rust, JS, TS, TSX, Python).
+*   **Context-Aware Repo Mapping:** Generates a highly compressed repository map containing only symbol signatures (functions, structs, classes) rather than raw file contents.
+*   **Surgical Chunking:** The executor interacts with specific AST nodes (e.g., `function_item:from_env`) rather than arbitrary line numbers, drastically reducing the margin for patch application errors.
+
+### Deterministic Verification & Feedback Loop
+LLMs are inherently probabilistic; engineering requires determinism. BAGENTS bridges this gap via an active feedback loop:
+*   Post-mutation, the engine triggers local build systems or linters (via `VERIFY_COMMAND`).
+*   Standard error and standard output streams (e.g., `cargo` compiler diagnostics) are parsed, correlated with the modified files, and fed back into the Developer agent's context. The agent is forced to remediate its own syntax or logical errors before proceeding to the peer review stage.
+
+### Resilient Output Processing & Fault Tolerance
+Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or produce malformed structural outputs. The `helper_output` pipeline provides defensive parsing:
+*   **Heuristic JSON Repair:** Automatically recovers from truncated payloads by intelligently closing strings, arrays, and object braces, preventing pipeline crashes.
+*   **Chain-of-Thought Stripping:** Safely extracts actionable JSON from intermediate `<think>` blocks.
+*   **Fuzzy Patch Application:** Normalizes search-and-replace blocks to handle CRLF mismatches, trailing whitespace drift, and indentation variance.
+
+### Context & Cost Optimization
+*   **Ephemeral Prompt Caching:** Natively supports Anthropic's prompt caching protocols (`anthropic-beta: prompt-caching-2024-10-22`), achieving significant latency reduction and cost efficiency when providing the repository map to the context window.
+*   **Token Budgeting:** Implements pagination for file reading. If an architectural plan exceeds the optimal context threshold, the system defers secondary modifications to a subsequent execution cycle.
 
 ---
 
-## How to Run
+## Execution Pipeline
+
+1.  **Poll & Checkout:** Polls the GitHub API for unresolved issues. Isolates state by creating a targeted feature branch (`feature/issue-<id>`).
+2.  **Analyze & Plan:** Generates the AST-based repository map. The Team Lead outputs a deterministic execution scope.
+3.  **Read-Before-Write (RBW):** The Developer agent inspects the exact current state of the requested files or semantic chunks.
+4.  **Mutate:** The Developer agent issues patches via targeted block replacements or AST node overrides.
+5.  **Verify:** The system executes local toolchains (e.g., `cargo check`, `npm run lint`). Failures trigger an immediate remediation loop.
+6.  **Review:** The Reviewer agent asserts the diff against the issue criteria. Rejections trigger a remediation loop.
+7.  **Deliver:** Upon consensus, the system commits the validated state, pushes to the remote, and opens a comprehensive Pull Request.
+
+---
+
+## Deployment & Configuration
 
 ### Prerequisites
+*   Rust 1.80+ (Edition 2024)
+*   Git CLI installed and configured in the system PATH.
+*   A GitHub Personal Access Token (PAT) with `repo` scopes.
 
-- Git configured with SSH access to your GitHub account (pushing must work without a password prompt)
-- A GitHub Personal Access Token (Classic) with repository permissions
-- An LLM API Key (e.g. Groq, OpenAI)
-- Docker and Docker Compose (Recommended) **OR** Rust installed locally
+### Initialization
 
----
-
-## Installation
-
-Clone the repository to your local machine:
-
+1. Clone the repository and compile the binary:
 ```bash
-git clone git@github.com:[YOUR_USERNAME]/bagents.git
-cd bagents
+   git clone [https://github.com/yourusername/bagents.git](https://github.com/yourusername/bagents.git)
+   cd bagents
+   cargo build --release
+
 ```
 
-## Configuration
-
-Create a `.env` file in the root directory of the project.
-
-### Example `.env` configuration
+2. Establish the environment configuration (`.env`):
 
 ```env
-# ── LLM Provider ─────────────────────────────────────────────────────────────
-LLM_API_KEY="your_llm_api_key_here"
-LLM_API_URL="https://api.groq.com/openai/v1/chat/completions"
-LLM_MODEL="llama-3.3-70b-versatile"
-LLM_TEMPERATURE="0.2"
+   # Version Control Integration
+   GITHUB_TOKEN=your_github_pat
+   GITHUB_OWNER=target_organization_or_user
+   GITHUB_REPO=target_repository_name
+   
+   # Workspace Isolation
+   # Absolute path to the local clone of the target repository. 
+   # BAGENTS will perform destructive operations (git reset, branch, checkout) here.
+   WORKSPACE_DIR=/path/to/local/target/repo
+   
+   # LLM Provider Configuration
+   LLM_API_URL=[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)
+   LLM_API_KEY=your_api_key
+   LLM_MODEL=claude-3-5-sonnet-20241022
+   LLM_TEMPERATURE=0.2
+   LLM_JSON_MODE=none # Specify "openai" to enforce JSON schema compliance on compatible endpoints
+   
+   # Token Thresholds
+   LLM_MAX_TOKENS=4096
+   LLM_MAX_TOKENS_LARGE=8192
+   
+   # CI/CD Emulation
+   VERIFY_COMMAND=cargo check
 
-# JSON mode: "openai" (default), "groq", "ollama", or "none"
-LLM_JSON_MODE="openai"
-
-# Max output tokens for planning/review requests (default: 4096)
-LLM_MAX_TOKENS="4096"
-
-# Max output tokens for developer requests — these produce full file content
-# and need more room. Increase if agents are truncating. (default: 8192)
-LLM_MAX_TOKENS_LARGE="8192"
-
-# ── GitHub ────────────────────────────────────────────────────────────────────
-GITHUB_TOKEN="your_github_personal_access_token_here"
-GITHUB_OWNER="target_github_username"
-GITHUB_REPO="target_repository_name"
-
-# ── Workspace ─────────────────────────────────────────────────────────────────
-# Absolute path where the target repository is located
-WORKSPACE_DIR="/workspace"
-
-# Command to verify the code before review (leave blank to skip)
-VERIFY_COMMAND="cargo check"
 ```
 
-### Tuning for truncation issues
-
-If developer agents are cutting responses short or producing incomplete code, increase the token limits:
-
-```env
-LLM_MAX_TOKENS_LARGE="16384"
-```
-
-Note: your provider must support the requested output token count. Check your plan limits.
-
----
-
-## Execution
-
-### Recommended: Using Docker
-
-Running BAGENTS via Docker ensures that the AI has a safe, isolated environment with the correct language dependencies.
-
-1. Open the `docker-compose.yml` file
-2. Ensure `PROJECT_LANG` matches your repo (`rust`, `node`, `python`)
-3. Ensure the volume mapping points to your target repository
-
-Start the agent:
+3. Provision the prompt definitions:
+Ensure the `config/` directory is populated with the requisite system prompts: `team_lead.md`, `backend_dev.md`, `frontend_dev.md`, `devops_dev.md`, and `reviewer.md`.
+4. Execute the orchestration engine:
 
 ```bash
-docker compose up --build
-```
-
-The agent will immediately begin polling GitHub for issues, checking out branches, and writing code in the mapped volume.
-
----
-
-### Alternative: Run Locally
-
-1. Update `WORKSPACE_DIR` in your `.env` file to the absolute path of your repository
-2. Ensure the required language toolchains are installed (Rust, Node.js, etc.)
-3. Start the system:
-
-```bash
-cargo run
-```
-
-## Usage
-
-To trigger BAGENTS:
-
-1. Go to your target repository on GitHub
-2. Create a new Issue
-3. Describe the task clearly and in detail
-
-**Example:**
+   RUST_LOG=info ./target/release/bagents
 
 ```
-Implement a user authentication middleware in src/middleware.ts
 
-The middleware should:
-- Read the Authorization header
-- Validate the JWT token
-- Attach the decoded user object to the request context
-- Return 401 if the token is missing or invalid
-```
+## License
 
-The more specific your issue description, the better the output. Include file paths, function names, and expected behaviour where possible.
+This architecture is distributed under the [MIT License](https://www.google.com/search?q=LICENSE).
 
-BAGENTS will automatically detect the issue and begin processing within a minute.
-
----
-
-## Architecture
-
-```
-orchestrator
-├── plan_issue          → Team Lead agent: reads codebase, assigns agent, writes plan
-├── apply_token_budget  → Enforces per-cycle file limit; defers extras to next cycle
-├── execute_dev_loop    → Developer agent: writes code, applies patches, runs verification
-│   ├── llm_client.ask_large  → Uses higher token limit for code generation
-│   ├── file_system.apply_modifications  → Semantic chunk or search/replace patching
-│   ├── git_local.run_verification       → Runs VERIFY_COMMAND
-│   └── review_code     → Reviewer agent: approves or rejects the diff
-└── deliver_pr          → Pushes branch and opens GitHub PR
-```
-
-### Agent Prompts (`config/`)
-
-| File | Agent | Role |
-|------|-------|------|
-| `team_lead.md` | Team Lead | Analyses issue, picks agent, writes plan |
-| `backend_dev.md` | Backend Dev | Writes server-side code (Rust, Python, Go, JS) |
-| `frontend_dev.md` | Frontend Dev | Writes UI code (React, Vue, HTML/CSS) |
-| `devops_dev.md` | DevOps Dev | Edits Cargo.toml, package.json, Dockerfiles, CI YAML |
-| `reviewer.md` | Reviewer | Validates the git diff, approves or rejects |
-
-All prompts can be edited without recompiling. The system re-reads them at startup.
-
-# Building a Full Project with BAGENTS
-
-BAGENTS is a highly capable coding engine, but it is not a "one-click project generator." It operates exactly like a team of Senior Developers waiting for well-defined tasks. To build an entire application from scratch, you must step into the role of the Product Manager and Architect.
-Here is the recommended workflow for building a complete, complex application:
-
-1. Bootstrap the Repository (Human)
-
-Do not ask BAGENTS to initialize a project from nothing. Run your framework's initialization commands (e.g., cargo new, npx create-next-app, npm init) yourself, set up your base directory structure, and push the initial commit to main.
-
-2. Write Atomic, Focused Issues (Human)
-
-To ensure high-quality code, prevent hallucinations, and respect token budgets, BAGENTS limits the number of files it modifies per cycle. Break your project down into small, logical features.
-
-- Bad : "Build a complete e-commerce backend with payment integration."
-
-- Good : "Create the Prisma schema for the User model and implement the JWT authentication middleware in src/auth.ts."
-
-3. Provide Clear Technical Direction (Human)
-
-BAGENTS is smart, but it cannot read your mind. The more specific your issue, the better the result.
-
-- Mention exact file paths you want modified
-- Specify which libraries or design patterns to use.
-- If you have specific business logic, outline it in bullet points.
-
-4. Sequential Execution (BAGENTS)
-
-Build your project step-by-step. Let BAGENTS process an issue, review its Pull Request, and merge it into main before creating the next dependent issue. This ensures BAGENTS always reads the most up-to-date, working codebase.
-
-### Example Progression: 
-
-1. Issue #1: "Set up the database connection pool in src/db.rs" ➔ Merge PR
-2. Issue #2: "Create the User struct and implement CRUD operations" ➔ Merge PR
-3. Issue #3: "Add a REST endpoint for user registration using axum" ➔ Merge PR
-
-By treating BAGENTS as a collaborative engineering team rather than a magic wand, you can incrementally build massive, production-ready systems without writing the boilerplate yourself.
