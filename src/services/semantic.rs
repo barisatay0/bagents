@@ -16,6 +16,7 @@ pub struct CodeChunk {
 #[derive(Debug, Clone)]
 pub struct SymbolSignature {
     /// Display name of the symbol (function name, struct name, etc.)
+    #[allow(dead_code)]
     pub name: String,
     /// Tree-sitter node kind (e.g. "function_item", "struct_item")
     pub kind: String,

@@ -126,6 +126,7 @@ pub async fn ask(
     ask_inner(config, system_prompt, user_prompt, false, None).await
 }
 
+#[allow(dead_code)]
 pub async fn ask_large(
     config: &Config,
     system_prompt: &str,
@@ -757,8 +758,8 @@ pub fn is_anthropic_endpoint(config: &Config) -> bool {
 fn extract_tool_response(
     res_json: &Value,
     raw_text: &str,
-    retries: u32,
-    max_retries: u32,
+    _retries: u32,
+    _max_retries: u32,
 ) -> Result<String, Box<dyn std::error::Error>> {
     if let Some(content_arr) = res_json["content"].as_array() {
         for block in content_arr {

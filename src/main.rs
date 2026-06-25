@@ -45,8 +45,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     tracing::info!(
-        owner = %config.github_owner,
-        repo = %config.github_repo,
+        tracker_project = %config.tracker_project,
+        repo_project = %config.repo_project,
         workspace = %config.workspace_dir.display(),
         model = %config.llm_model,
         "Configuration loaded"

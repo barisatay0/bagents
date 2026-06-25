@@ -3,9 +3,15 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
 pub struct Config {
-    pub github_token: String,
-    pub github_owner: String,
-    pub github_repo: String,
+    pub tracker_type: String,
+    pub tracker_url: String,
+    pub tracker_token: String,
+    pub tracker_username: Option<String>,
+    pub tracker_project: String,
+    pub repo_type: String,
+    pub repo_url: String,
+    pub repo_token: String,
+    pub repo_project: String,
     pub workspace_dir: PathBuf,
     pub llm_api_key: String,
     pub llm_api_url: String,
@@ -39,9 +45,20 @@ impl Config {
             };
         }
 
-        let github_token = require!("GITHUB_TOKEN");
-        let github_owner = require!("GITHUB_OWNER");
-        let github_repo = require!("GITHUB_REPO");
+        let tracker_type = env::var("TRACKER_TYPE").unwrap_or_else(|_| "github".to_string());
+        let tracker_url = env::var("TRACKER_URL").unwrap_or_else(|_| {
+            if tracker_type == "gitlab" { "https://gitlab.com".to_string() } else { "https://api.github.com".to_string() }
+        });
+        let tracker_token = require!("TRACKER_TOKEN");
+        let tracker_username = env::var("TRACKER_USERNAME").ok();
+        let tracker_project = require!("TRACKER_PROJECT");
+
+        let repo_type = env::var("REPO_TYPE").unwrap_or_else(|_| "github".to_string());
+        let repo_url = env::var("REPO_URL").unwrap_or_else(|_| {
+            if repo_type == "gitlab" { "https://gitlab.com".to_string() } else { "https://api.github.com".to_string() }
+        });
+        let repo_token = require!("REPO_TOKEN");
+        let repo_project = require!("REPO_PROJECT");
         let workspace_raw = require!("WORKSPACE_DIR");
         let llm_api_url = require!("LLM_API_URL");
         let llm_model = require!("LLM_MODEL");
@@ -74,9 +91,15 @@ impl Config {
         }
 
         Ok(Self {
-            github_token,
-            github_owner,
-            github_repo,
+            tracker_type,
+            tracker_url,
+            tracker_token,
+            tracker_username,
+            tracker_project,
+            repo_type,
+            repo_url,
+            repo_token,
+            repo_project,
             workspace_dir,
             llm_api_key,
             llm_api_url,

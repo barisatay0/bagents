@@ -15,7 +15,7 @@ Engineered with systems design principles, BAGENTS mitigates common LLM integrat
 ```
 2026-06-02T07:27:10.100Z  INFO bagents: Configuration loaded owner="acme-corp" repo="core-api" workspace="/tmp/core-api" model="claude-3-5-sonnet-20241022"
 2026-06-02T07:27:10.102Z  INFO bagents::orchestrator: Factory started — polling for issues continuously
-2026-06-02T07:27:10.105Z  INFO bagents::orchestrator: Checking GitHub for open issues...
+2026-06-02T07:27:10.105Z  INFO bagents::orchestrator: Checking tracker for open issues...
 2026-06-02T07:27:11.450Z  INFO bagents::orchestrator: Processing issue issue=42 title="Fix out of bounds panic in config parser"
 2026-06-02T07:27:11.500Z  INFO bagents::git_local: Resetting workspace to main branch
 2026-06-02T07:27:12.100Z  INFO bagents::git_local: Creating new branch branch="feature/issue-42"
@@ -43,9 +43,9 @@ Fix ONLY the errors in files you modified. Do not change unrelated code.
 2026-06-02T07:27:42.800Z  INFO bagents::orchestrator: Reviewer analysing code...
 2026-06-02T07:27:47.300Z  INFO bagents::orchestrator: Review approved on attempt 2
 2026-06-02T07:27:47.350Z  INFO bagents::git_local: Pushing branch to remote branch="feature/issue-42"
-2026-06-02T07:27:49.100Z  INFO bagents::github: Pull request created url="https://github.com/acme-corp/core-api/pull/43"
+2026-06-02T07:27:49.100Z  INFO bagents::repo_service: Pull request created url="https://github.com/acme-corp/core-api/pull/43"
 2026-06-02T07:27:49.105Z  INFO bagents::orchestrator: Issue completed successfully issue=42
-2026-06-02T07:27:59.110Z  INFO bagents::orchestrator: Checking GitHub for open issues...
+2026-06-02T07:27:59.110Z  INFO bagents::orchestrator: Checking tracker for open issues...
 2026-06-02T07:28:00.120Z  INFO bagents::orchestrator: No new issues — resting for 30s
 ```
 ## Core Architecture
@@ -80,7 +80,7 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
 
 ## Execution Pipeline
 
-1.  **Poll & Checkout:** Polls the GitHub API for unresolved issues. Isolates state by creating a targeted feature branch (`feature/issue-<id>`).
+1.  **Poll & Checkout:** Polls the configured Issue Tracker API for unresolved issues. Isolates state by creating a targeted feature branch (`feature/issue-<id>`).
 2.  **Analyze & Plan:** Generates the AST-based repository map. The Team Lead outputs a deterministic execution scope.
 3.  **Read-Before-Write (RBW):** The Developer agent inspects the exact current state of the requested files or semantic chunks.
 4.  **Mutate:** The Developer agent issues patches via targeted block replacements or AST node overrides.
@@ -95,7 +95,7 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
 ### Prerequisites
 *   Rust 1.80+ (Edition 2024)
 *   Git CLI installed and configured in the system PATH.
-*   A GitHub Personal Access Token (PAT) with `repo` scopes.
+*   An API token for your chosen Tracker/Repository Provider (e.g., GitHub PAT, GitLab Access Token).
 
 ### Initialization
 
@@ -108,11 +108,21 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
 2. Establish the environment configuration (`.env`):
 
 ```env
-   # Version Control Integration
-   GITHUB_TOKEN=your_github_pat
-   GITHUB_OWNER=target_organization_or_user
-   GITHUB_REPO=target_repository_name
-   
+   # Architecture Configuration
+   TRACKER_TYPE=github # "github", "gitlab", or "jira"
+   REPO_TYPE=github    # "github", "gitlab", or "forgejo"
+
+   # Tracker Configuration
+   TRACKER_URL=https://api.github.com
+   TRACKER_TOKEN=your_tracker_token
+   TRACKER_PROJECT=owner/repo # "owner/repo" for github, project ID for gitlab, KEY for jira
+   # TRACKER_USERNAME=email@example.com # Required for Jira
+
+   # Repository Configuration
+   REPO_URL=https://api.github.com
+   REPO_TOKEN=your_repo_token
+   REPO_PROJECT=owner/repo
+
    # Workspace Isolation
    # Absolute path to the local clone of the target repository. 
    # BAGENTS will perform destructive operations (git reset, branch, checkout) here.
