@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.2.0](https://github.com/barisatay0/bagents/compare/v0.1.0...v0.2.0) (2026-06-29)
+
+
+### Features
+
+* generic tracker and repo implementation. ([6845086](https://github.com/barisatay0/bagents/commit/6845086909372e11dcfd512d41154a82c7f28b86))
+* generic tracker and repo implementation. ([3b19315](https://github.com/barisatay0/bagents/commit/3b19315905e5433b3fa1a467e1d5b6f80a1abb2f))
+
+
+### Bug Fixes
+
+* fixed some needless logics ([589b065](https://github.com/barisatay0/bagents/commit/589b065665d96a7bfa1778b218e8d3f1e20af587))
+* fixed some needless logics ([57b9924](https://github.com/barisatay0/bagents/commit/57b9924eedf17dda0a648711c80edd33d54279df))
+
 ## 0.1.0 (2026-06-02)
 
 
