@@ -207,8 +207,8 @@ fn parse_cargo_diagnostics(raw: &str) -> Vec<Diagnostic> {
             let mut file_path = String::new();
             let mut diag_line: Option<u32> = None;
 
-            for j in (i + 1)..(i + 6).min(lines.len()) {
-                let candidate = lines[j].trim();
+            for candidate_line in lines.iter().skip(i + 1).take(5) {
+                let candidate = candidate_line.trim();
                 if let Some(rest) = candidate.strip_prefix("-->") {
                     let loc = rest.trim();
                     let mut parts = loc.splitn(3, ':');
@@ -267,8 +267,9 @@ fn parse_generic_diagnostics(raw: &str) -> Vec<Diagnostic> {
                 || file_candidate.starts_with("lib")
                 || file_candidate.starts_with("tests");
 
-            if looks_like_path {
-                if let Ok(line_no) = line_candidate.parse::<u32>() {
+            if looks_like_path
+                && let Ok(line_no) = line_candidate.parse::<u32>()
+            {
                     let raw_msg = parts[2..].join(":").trim().to_string();
                     let message = {
                         let segments: Vec<&str> = raw_msg.splitn(2, ':').collect();
@@ -285,7 +286,6 @@ fn parse_generic_diagnostics(raw: &str) -> Vec<Diagnostic> {
                         message,
                     });
                     continue;
-                }
             }
         }
 

@@ -230,10 +230,9 @@ fn extract_signature_lines(source_lines: &[&str], start_row: usize, kind: &str) 
     let is_python_def = kind.contains("function_definition") || kind.contains("class_definition");
 
     let mut parts: Vec<&str> = Vec::new();
-    let cap = (start_row + 4).min(source_lines.len());
 
-    for row in start_row..cap {
-        let line = source_lines[row].trim_end();
+    for line_ref in source_lines.iter().skip(start_row).take(4) {
+        let line = line_ref.trim_end();
         parts.push(line);
 
         if is_python_def {

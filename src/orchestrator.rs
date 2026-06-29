@@ -245,8 +245,6 @@ async fn execute_dev_loop(
 
         let initial_user_content = if supports_tools && use_anthropic_cache {
             build_user_content(&dynamic_prompt, Some(&static_context), true)
-        } else if supports_tools {
-            serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
         } else {
             serde_json::json!(format!("{}\n\n{}", static_context, dynamic_prompt))
         };

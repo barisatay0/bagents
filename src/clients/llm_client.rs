@@ -721,10 +721,10 @@ pub fn build_user_content(
 fn extract_text_content(res_json: &Value) -> String {
     if let Some(content_arr) = res_json["content"].as_array() {
         for block in content_arr {
-            if block["type"].as_str() == Some("text") {
-                if let Some(t) = block["text"].as_str() {
-                    return t.to_string();
-                }
+            if block["type"].as_str() == Some("text")
+                && let Some(t) = block["text"].as_str()
+            {
+                return t.to_string();
             }
         }
     }
