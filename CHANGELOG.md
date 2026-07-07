@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.2.0](https://github.com/barisatay0/bagents/compare/v0.1.0...v0.2.0) (2026-07-07)
+
+
+### Features
+
+* enhance security, LLM compatibility and automation reliability ([68d8380](https://github.com/barisatay0/bagents/commit/68d83803aab4beabc04718dd2e7829135affcad7))
+* enhance security, LLM compatibility and automation reliability ([4d6a7b3](https://github.com/barisatay0/bagents/commit/4d6a7b3f2eb329b875ba707372b6f313f8661c5d))
+* generic tracker and repo implementation. ([6845086](https://github.com/barisatay0/bagents/commit/6845086909372e11dcfd512d41154a82c7f28b86))
+* generic tracker and repo implementation. ([3b19315](https://github.com/barisatay0/bagents/commit/3b19315905e5433b3fa1a467e1d5b6f80a1abb2f))
+
+
+### Bug Fixes
+
+* fixed some needless logics ([589b065](https://github.com/barisatay0/bagents/commit/589b065665d96a7bfa1778b218e8d3f1e20af587))
+* fixed some needless logics ([57b9924](https://github.com/barisatay0/bagents/commit/57b9924eedf17dda0a648711c80edd33d54279df))
+
 ## 0.1.0 (2026-06-02)
 
 
