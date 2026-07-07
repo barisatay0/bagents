@@ -21,6 +21,9 @@ pub struct Config {
     pub verify_command: String,
     pub llm_max_tokens: u32,
     pub llm_max_tokens_large: u32,
+    pub base_branch: String,
+    pub poll_interval_secs: u64,
+    pub error_retry_secs: u64,
 }
 
 impl Config {
@@ -75,6 +78,33 @@ impl Config {
         let llm_max_tokens = optional_u32!("LLM_MAX_TOKENS", 4096);
         let llm_max_tokens_large = optional_u32!("LLM_MAX_TOKENS_LARGE", 8192);
 
+        let base_branch = env::var("BASE_BRANCH").unwrap_or_else(|_| "main".to_string());
+        let poll_interval_secs = env::var("POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let error_retry_secs = env::var("ERROR_RETRY_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60);
+
+        let valid_tracker_types = vec!["github", "gitlab", "jira"];
+        let valid_repo_types = vec!["github", "gitlab", "forgejo"];
+
+        if !valid_tracker_types.contains(&tracker_type.as_str()) {
+            errors.push(format!(
+                "  - TRACKER_TYPE '{}' is not supported. Supported tracker types are: {:?}",
+                tracker_type, valid_tracker_types
+            ));
+        }
+
+        if !valid_repo_types.contains(&repo_type.as_str()) {
+            errors.push(format!(
+                "  - REPO_TYPE '{}' is not supported. Supported repo types are: {:?}",
+                repo_type, valid_repo_types
+            ));
+        }
+
         if !errors.is_empty() {
             return Err(format!(
                 "Configuration errors — fix your .env file:\n{}",
@@ -109,6 +139,9 @@ impl Config {
             verify_command,
             llm_max_tokens,
             llm_max_tokens_large,
+            base_branch,
+            poll_interval_secs,
+            error_retry_secs,
         })
     }
 }

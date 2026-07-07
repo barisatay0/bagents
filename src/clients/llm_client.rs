@@ -107,6 +107,20 @@ pub fn read_file_tool() -> Value {
     })
 }
 
+fn to_openai_tool(anthropic_tool: Value) -> Value {
+    let name = anthropic_tool["name"].clone();
+    let description = anthropic_tool["description"].clone();
+    let parameters = anthropic_tool["input_schema"].clone();
+    json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters
+        }
+    })
+}
+
 pub enum DevTurnResult {
     ReadFile {
         tool_use_id: String,
@@ -167,10 +181,17 @@ pub async fn ask_dev_turn(
     let max_retries = 6u32;
 
     loop {
+        let is_anthropic = is_anthropic_endpoint(config);
         let mut req = client
             .post(&config.llm_api_url)
-            .bearer_auth(&config.llm_api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
+
+        if is_anthropic {
+            req = req.header("x-api-key", &config.llm_api_key)
+                     .header("anthropic-version", "2023-06-01");
+        } else {
+            req = req.bearer_auth(&config.llm_api_key);
+        }
 
         if use_anthropic_cache {
             req = req.header("anthropic-beta", ANTHROPIC_CACHE_BETA);
@@ -204,9 +225,8 @@ pub async fn ask_dev_turn(
             let jitter = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_millis()
-                % 5000) as u64
-                / 1000;
+                .subsec_nanos()
+                % 5) as u64;
             let wait = base_wait + jitter;
             warn!(attempt = retries + 1, max_retries, wait_secs = wait, "Rate limit — backing off");
             sleep(Duration::from_secs(wait)).await;
@@ -275,11 +295,15 @@ fn build_dev_turn_body(
     } else {
         let mut messages = vec![json!({ "role": "system", "content": system_prompt })];
         messages.extend_from_slice(conversation);
+        let openai_tools = json!([
+            to_openai_tool(read_file_tool()),
+            to_openai_tool(apply_patch_tool())
+        ]);
         json!({
             "model": config.llm_model,
             "max_tokens": max_tokens,
             "messages": messages,
-            "tools": tools,
+            "tools": openai_tools,
             "tool_choice": "required",
             "temperature": config.llm_temperature
         })
@@ -413,10 +437,17 @@ async fn ask_inner(
     let max_retries = 6u32;
 
     loop {
+        let is_anthropic = is_anthropic_endpoint(config);
         let mut req = client
             .post(&config.llm_api_url)
-            .bearer_auth(&config.llm_api_key)
             .header(reqwest::header::CONTENT_TYPE, "application/json");
+
+        if is_anthropic {
+            req = req.header("x-api-key", &config.llm_api_key)
+                     .header("anthropic-version", "2023-06-01");
+        } else {
+            req = req.bearer_auth(&config.llm_api_key);
+        }
 
         if use_anthropic_cache {
             req = req.header("anthropic-beta", ANTHROPIC_CACHE_BETA);
@@ -445,9 +476,8 @@ async fn ask_inner(
             let jitter = (std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .subsec_millis()
-                % 5000) as u64
-                / 1000;
+                .subsec_nanos()
+                % 5) as u64;
             let wait = base_wait + jitter;
             warn!(
                 attempt = retries + 1,
@@ -649,15 +679,16 @@ fn build_openai_body(
     };
 
     let mut body = if use_tool_calling {
+        let openai_tools = json!([to_openai_tool(apply_patch_tool())]);
         json!({
             "model": config.llm_model,
             "max_tokens": max_tokens,
-            "system": system_prompt,
             "messages": [
+                { "role": "system", "content": system_prompt },
                 { "role": "user", "content": full_user }
             ],
-            "tools": [apply_patch_tool()],
-            "tool_choice": { "type": "any" },
+            "tools": openai_tools,
+            "tool_choice": "required",
             "temperature": config.llm_temperature
         })
     } else {

@@ -45,8 +45,8 @@ pub fn commit_changes(config: &Config, message: &str) -> Result<(), String> {
     Ok(())
 }
 
-pub fn get_diff_against_main(config: &Config) -> Result<String, String> {
-    let out = run(config, &["diff", "-U2", "main"])?;
+pub fn get_diff_against_base(config: &Config) -> Result<String, String> {
+    let out = run(config, &["diff", "-U2", &config.base_branch])?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
@@ -63,13 +63,13 @@ pub fn push_to_remote(config: &Config, branch_name: &str) -> Result<(), String> 
     Ok(())
 }
 
-pub fn reset_to_main(config: &Config) -> Result<(), String> {
-    info!("Resetting workspace to main branch");
+pub fn reset_to_base(config: &Config) -> Result<(), String> {
+    info!("Resetting workspace to {} branch", config.base_branch);
 
     run(config, &["reset", "--hard"])?;
-    run(config, &["checkout", "main"])?;
+    run(config, &["checkout", &config.base_branch])?;
 
-    let out = run(config, &["pull", "origin", "main"])?;
+    let out = run(config, &["pull", "origin", &config.base_branch])?;
     if !out.status.success() {
         warn!(
             stderr = %String::from_utf8_lossy(&out.stderr),
@@ -105,13 +105,9 @@ pub fn run_verification(config: &Config) -> Result<(), String> {
 
     info!("Running verification command: {}", config.verify_command);
 
-    let parts: Vec<&str> = config.verify_command.split_whitespace().collect();
-    if parts.is_empty() {
-        return Ok(());
-    }
-
-    let out = Command::new(parts[0])
-        .args(&parts[1..])
+    let out = Command::new("sh")
+        .arg("-c")
+        .arg(&config.verify_command)
         .current_dir(&config.workspace_dir)
         .output()
         .map_err(|e| format!("Failed to run verification command: {}", e))?;
@@ -148,8 +144,10 @@ fn parse_diagnostics(raw: &str, verify_command: &str) -> String {
 
     if diagnostics.is_empty() {
         let trimmed = raw.trim();
-        let snippet = if trimmed.len() > 1500 {
-            format!("…[truncated]\n{}", &trimmed[trimmed.len() - 1500..])
+        let snippet = if trimmed.chars().count() > 1500 {
+            let start_char_idx = trimmed.chars().count() - 1500;
+            let byte_idx = trimmed.char_indices().nth(start_char_idx).map(|(idx, _)| idx).unwrap_or(0);
+            format!("…[truncated]\n{}", &trimmed[byte_idx..])
         } else {
             trimmed.to_string()
         };
@@ -304,4 +302,40 @@ fn parse_generic_diagnostics(raw: &str) -> Vec<Diagnostic> {
     }
 
     diagnostics
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_cargo_diagnostics() {
+        let err_output = r#"
+   Compiling my_project v0.1.0 (/workspace)
+error[E0308]: mismatched types
+  --> src/main.rs:10:15
+   |
+10 |     let x: u32 = "hello";
+   |            ---   ^^^^^^^ expected `u32`, found `&str`
+   |            |
+   |            expected due to this
+        "#;
+        let parsed = parse_cargo_diagnostics(err_output);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].file_path, "src/main.rs");
+        assert_eq!(parsed[0].line, Some(10));
+        assert_eq!(parsed[0].message, "mismatched types");
+    }
+
+    #[test]
+    fn test_parse_generic_diagnostics() {
+        let err_output = r#"
+src/app.js:20:10: error: Unexpected identifier
+        "#;
+        let parsed = parse_generic_diagnostics(err_output);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].file_path, "src/app.js");
+        assert_eq!(parsed[0].line, Some(20));
+        assert_eq!(parsed[0].message, "error: Unexpected identifier");
+    }
 }

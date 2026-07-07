@@ -48,11 +48,13 @@ impl IssueTracker for GitlabService {
         let mut issues = Vec::new();
         if let Value::Array(arr) = json {
             for item in arr {
-                if let (Some(iid), Some(title), Some(desc)) = (
+                if let (Some(iid), Some(title)) = (
                     item.get("iid").and_then(|v| v.as_u64()),
                     item.get("title").and_then(|v| v.as_str()),
-                    item.get("description").and_then(|v| v.as_str()),
                 ) {
+                    let desc = item.get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     issues.push(Issue {
                         id: iid.to_string(),
                         title: title.to_string(),
