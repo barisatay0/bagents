@@ -60,7 +60,10 @@ pub fn apply_modifications(
     modifications: Vec<FileModification>,
 ) -> Result<(), String> {
     for modif in modifications {
-        let full_path = config.workspace_dir.join(&modif.file_path);
+        let full_path = match crate::helpers::path_safety::safe_join(&config.workspace_dir, &modif.file_path) {
+            Some(p) => p,
+            None => return Err(format!("Unsafe path detected: '{}'", modif.file_path)),
+        };
 
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -259,7 +262,14 @@ pub fn read_specific_files(config: &Config, files: Vec<String>) -> String {
     let mut out = String::from("REQUESTED FILE CONTENTS:\n");
 
     for file_path in files {
-        let full_path = config.workspace_dir.join(&file_path);
+        let Some(full_path) = crate::helpers::path_safety::safe_join(&config.workspace_dir, &file_path) else {
+            warn!(path = %file_path, "Unsafe path detected — skipping");
+            out.push_str(&format!(
+                "\n--- FILE: {} (unsafe path) ---\n",
+                file_path
+            ));
+            continue;
+        };
         match fs::read_to_string(&full_path) {
             Ok(content) if content.len() > 50_000 => {
                 warn!(path = %file_path, "File too large — skipping");
@@ -284,7 +294,10 @@ pub fn read_specific_files(config: &Config, files: Vec<String>) -> String {
 pub fn read_semantic_outlines(config: &Config, files: Vec<String>) -> String {
     let mut out = String::from("SEMANTIC FILE OUTLINES:\n");
     for file_path in files {
-        let full_path = config.workspace_dir.join(&file_path);
+        let Some(full_path) = crate::helpers::path_safety::safe_join(&config.workspace_dir, &file_path) else {
+            out.push_str(&format!("\n--- FILE: {} (unsafe path) ---\n", file_path));
+            continue;
+        };
         match fs::read_to_string(&full_path) {
             Ok(content) => {
                 let chunks =
@@ -313,7 +326,10 @@ pub fn read_semantic_outlines(config: &Config, files: Vec<String>) -> String {
 }
 
 pub fn read_specific_chunks(config: &Config, file_path: &str, chunk_names: Vec<String>) -> String {
-    let full_path = config.workspace_dir.join(file_path);
+    let full_path = match crate::helpers::path_safety::safe_join(&config.workspace_dir, file_path) {
+        Some(p) => p,
+        None => return format!("Error: Unsafe path detected: {}\n", file_path),
+    };
     let mut out = format!("SPECIFIC CODE BLOCKS FROM {}:\n", file_path);
 
     match fs::read_to_string(&full_path) {
@@ -373,5 +389,29 @@ fn collect_paths(dir: &Path, workspace: &Path, paths: &mut Vec<String>) {
                 .to_string();
             paths.push(rel);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_fuzzy_match_range() {
+        let existing = "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}";
+        let search = "fn add(a:i32,b:i32) -> i32";
+        let matched = find_fuzzy_match_range(existing, search);
+        assert!(matched.is_some());
+        let (start, end) = matched.unwrap();
+        assert_eq!(&existing[start..end], "fn add(a: i32, b: i32) -> i32");
+    }
+
+    #[test]
+    fn test_apply_one_search_replace() {
+        let existing = "line 1\nline 2\nline 3";
+        let search = "line 2";
+        let replace = "line 2 modified";
+        let result = apply_one_search_replace("test.txt", existing, search, replace, 0);
+        assert_eq!(result, Ok("line 1\nline 2 modified\nline 3".to_string()));
     }
 }

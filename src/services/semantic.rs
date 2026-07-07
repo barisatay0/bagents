@@ -88,16 +88,21 @@ pub fn extract_semantic_chunks(file_path: &str, source_code: &str) -> Vec<CodeCh
     };
 
     let mut parser = Parser::new();
-    parser
-        .set_language(language)
-        .expect("Error loading grammar");
+    if parser.set_language(language).is_err() {
+        return vec![];
+    }
 
-    let tree = parser
-        .parse(source_code, None)
-        .expect("Error parsing source code");
-    let query = Query::new(language, query_str).expect("Error compiling query");
+    let tree = match parser.parse(source_code, None) {
+        Some(t) => t,
+        None => return vec![],
+    };
+
+    let query = match Query::new(language, query_str) {
+        Ok(q) => q,
+        Err(_) => return vec![],
+    };
+
     let mut cursor = QueryCursor::new();
-
     let matches = cursor.matches(&query, tree.root_node(), source_code.as_bytes());
     let mut chunks = Vec::new();
 
@@ -112,7 +117,7 @@ pub fn extract_semantic_chunks(file_path: &str, source_code: &str) -> Vec<CodeCh
                 name = capture
                     .node
                     .utf8_text(source_code.as_bytes())
-                    .unwrap()
+                    .unwrap_or("")
                     .to_string();
             } else if capture_name == "block" {
                 block_node = Some(capture.node);
@@ -120,7 +125,7 @@ pub fn extract_semantic_chunks(file_path: &str, source_code: &str) -> Vec<CodeCh
         }
 
         if let Some(node) = block_node {
-            let content = node.utf8_text(source_code.as_bytes()).unwrap().to_string();
+            let content = node.utf8_text(source_code.as_bytes()).unwrap_or("").to_string();
             let kind_str = node.kind().to_string();
             let unique_name = format!("{}:{}", kind_str, name);
 

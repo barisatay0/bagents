@@ -109,8 +109,9 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
 
 ```env
    # Architecture Configuration
-   TRACKER_TYPE=github # "github", "gitlab", or "jira"
-   REPO_TYPE=github    # "github", "gitlab", or "forgejo"
+   TRACKER_TYPE=github # "github", "gitlab", or "jira". "jira" is issue tracker ONLY.
+   REPO_TYPE=github    # "github", "gitlab", or "forgejo". "forgejo" is repo service ONLY.
+                       # Mixed configurations (e.g. tracker "jira" + repo "forgejo") are fully supported.
 
    # Tracker Configuration
    TRACKER_URL=https://api.github.com
@@ -129,7 +130,7 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
    WORKSPACE_DIR=/path/to/local/target/repo
    
    # LLM Provider Configuration
-   LLM_API_URL=[https://api.anthropic.com/v1/messages](https://api.anthropic.com/v1/messages)
+   LLM_API_URL=https://api.anthropic.com/v1/messages
    LLM_API_KEY=your_api_key
    LLM_MODEL=claude-3-5-sonnet-20241022
    LLM_TEMPERATURE=0.2
@@ -141,6 +142,11 @@ Modern reasoning models (such as DeepSeek-R1) often inject reasoning tokens or p
    
    # CI/CD Emulation
    VERIFY_COMMAND=cargo check
+
+   # Branch and Polling Customization (Optional)
+   # BASE_BRANCH=main # Base/target branch name (default is "main")
+   # POLL_INTERVAL_SECS=30 # Polling rest interval in seconds (default is 30)
+   # ERROR_RETRY_SECS=60 # Cooldown retry interval on errors in seconds (default is 60)
 
 ```
 

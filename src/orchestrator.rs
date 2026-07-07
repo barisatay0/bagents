@@ -1,6 +1,7 @@
-use std::collections::HashSet;
 use tokio::time::{Duration, sleep};
 use tracing::{error, info, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use serde::{Serialize, Deserialize};
 
 use crate::clients::llm_client::{
     self, DevTurnResult, build_user_content, is_anthropic_endpoint, is_tool_calling_supported,
@@ -12,6 +13,68 @@ use crate::models::{
 };
 use crate::prompts::Prompts;
 use crate::services::{file_system, git_local, build_tracker, build_repo_service, IssueTracker, RepoService};
+
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigint = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
+        let mut sigterm = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+        tokio::select! {
+            _ = sigint.recv() => {
+                info!("Received SIGINT (Ctrl+C), starting graceful shutdown...");
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, starting graceful shutdown...");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await.expect("failed to listen for Ctrl+C");
+        info!("Received Ctrl+C, starting graceful shutdown...");
+    }
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+struct IssueState {
+    pub id: String,
+    pub status: String,
+    pub failure_count: u32,
+    pub last_attempted_at: u64,
+}
+
+#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+struct AppState {
+    pub issues: std::collections::HashMap<String, IssueState>,
+}
+
+impl AppState {
+    fn load() -> Self {
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join("bagents_state.json");
+        if !path.exists() {
+            return Self::default();
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn save(&self) {
+        let path = std::env::current_dir()
+            .unwrap_or_default()
+            .join("bagents_state.json");
+        if let Ok(content) = serde_json::to_string_pretty(self) {
+            let _ = std::fs::write(&path, content);
+        }
+    }
+}
 
 const PLACEHOLDER_MARKERS: &[&str] = &[
     "// TODO", "// FIXME", "// HACK", "// XXX", "todo!()", "unimplemented!()",
@@ -27,6 +90,9 @@ pub async fn run_factory(
     prompts: &Prompts,
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!("Factory started — polling for issues continuously");
+
+    // Spawn the graceful shutdown handler
+    tokio::spawn(shutdown_signal());
 
     let tracker = match build_tracker(config) {
         Ok(t) => t,
@@ -44,31 +110,75 @@ pub async fn run_factory(
         }
     };
 
-    let mut processed_issues: HashSet<String> = HashSet::new();
+    if config.tracker_type != config.repo_type {
+        info!(
+            tracker = %config.tracker_type,
+            repo = %config.repo_type,
+            "Mixed service configuration active (this is supported and valid)"
+        );
+    }
+
+    let mut state = AppState::load();
 
     loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            info!("Graceful shutdown requested. Exiting factory.");
+            break;
+        }
+
         info!("Checking for open issues...");
 
         let issues = match tracker.fetch_open_issues().await {
             Ok(i) => i,
             Err(e) => {
-                error!(err = %e, "Tracker API error — retrying in 60s");
-                sleep(Duration::from_secs(60)).await;
+                error!(err = %e, "Tracker API error — retrying in {}s", config.error_retry_secs);
+                for _ in 0..config.error_retry_secs {
+                    if SHUTDOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
                 continue;
             }
         };
 
         let target_issue = match issues
             .into_iter()
-            .find(|i| !processed_issues.contains(&i.id))
+            .find(|i| {
+                if let Some(istate) = state.issues.get(&i.id) {
+                    if istate.status == "success" {
+                        false
+                    } else if istate.failure_count >= 3 {
+                        false
+                    } else {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        now >= istate.last_attempted_at + 900
+                    }
+                } else {
+                    true
+                }
+            })
         {
             Some(i) => i,
             None => {
-                info!("No new issues — resting for 30s");
-                sleep(Duration::from_secs(30)).await;
+                info!("No new issues — resting for {}s", config.poll_interval_secs);
+                for _ in 0..config.poll_interval_secs {
+                    if SHUTDOWN.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    sleep(Duration::from_secs(1)).await;
+                }
                 continue;
             }
         };
+
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            info!("Graceful shutdown requested. Exiting factory before processing issue.");
+            break;
+        }
 
         info!(
             issue = %target_issue.id,
@@ -76,26 +186,56 @@ pub async fn run_factory(
             "Processing issue"
         );
 
-        if let Err(e) = git_local::reset_to_main(config) {
-            error!(err = %e, "Could not reset to main — skipping issue");
-            sleep(Duration::from_secs(10)).await;
+        if let Err(e) = git_local::reset_to_base(config) {
+            error!(err = %e, "Could not reset to base branch — skipping issue");
+            for _ in 0..10 {
+                if SHUTDOWN.load(Ordering::SeqCst) {
+                    break;
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
             continue;
         }
 
         let is_successful = process_issue(config, prompts, &target_issue, &*tracker, &*repo_service).await;
 
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let istate = state.issues.entry(target_issue.id.clone()).or_insert_with(|| IssueState {
+            id: target_issue.id.clone(),
+            status: String::new(),
+            failure_count: 0,
+            last_attempted_at: 0,
+        });
+
+        istate.last_attempted_at = now;
+
         if is_successful {
             info!(issue = %target_issue.id, "Issue completed successfully");
-            processed_issues.insert(target_issue.id.clone());
+            istate.status = "success".to_string();
+            state.save();
         } else {
+            istate.failure_count += 1;
+            istate.status = "failed".to_string();
             warn!(
                 issue = %target_issue.id,
+                failures = istate.failure_count,
                 "Issue failed, exhausted, or deferred"
             );
+            state.save();
         }
 
-        sleep(Duration::from_secs(10)).await;
+        for _ in 0..10 {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
     }
+    Ok(())
 }
 
 async fn plan_issue(
@@ -375,11 +515,14 @@ async fn execute_dev_loop(
 
         if let Err(verify_err) = git_local::run_verification(config) {
             let is_relevant_error = dev_res.files_to_modify.iter().any(|m| {
+                if m.file_path.is_empty() {
+                    return false;
+                }
                 let file_name = std::path::Path::new(&m.file_path)
                     .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy();
-                verify_err.contains(&m.file_path) || verify_err.contains(file_name.as_ref())
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_default();
+                verify_err.contains(&m.file_path) || (!file_name.is_empty() && verify_err.contains(file_name.as_ref()))
             });
 
             if is_relevant_error {
@@ -405,7 +548,11 @@ async fn execute_dev_loop(
             attempt,
             truncate_to(&dev_res.thought_process, 500)
         );
-        let _ = git_local::commit_changes(config, &commit_msg);
+        if let Err(e) = git_local::commit_changes(config, &commit_msg) {
+            warn!(err = %e, "Git commit failed — retrying dev turn");
+            feedback_history = format!("CRITICAL: git commit failed: {}", e);
+            continue;
+        }
 
         match review_code(config, prompts, issue_text, &lead_res.architectural_plan).await {
             Some(rev) if rev.is_approved => {
@@ -672,7 +819,7 @@ async fn review_code(
 ) -> Option<ReviewerResponse> {
     info!("Reviewer analysing code...");
 
-    let diff = git_local::get_diff_against_main(config).unwrap_or_default();
+    let diff = git_local::get_diff_against_base(config).unwrap_or_default();
 
     if diff.trim().is_empty() {
         warn!("Diff is empty — no changes were committed, auto-rejecting");
@@ -691,7 +838,7 @@ async fn review_code(
         "Original Issue: {}\nArchitectural Plan (Scope): {}\nDiff:\n{}",
         issue_text,
         architectural_plan,
-        truncate_to(diff, 12_000)
+        truncate_to(&diff, 12_000)
     );
 
     let raw = match llm_client::ask(config, &prompts.reviewer, &input).await {
@@ -730,7 +877,7 @@ async fn deliver_pr(
         issue_id, thought_process
     );
 
-    repo_service.create_pull_request(&title, &body, branch_name, "main").await
+    repo_service.create_pull_request(&title, &body, branch_name, &config.base_branch).await
 }
 
 async fn process_issue(
@@ -794,7 +941,7 @@ async fn process_issue(
 
     if !result.success {
         error!(issue = %issue.id, "Dev loop exhausted — no PR opened");
-        let _ = git_local::reset_to_main(config);
+        let _ = git_local::reset_to_base(config);
         return false;
     }
 
@@ -834,8 +981,8 @@ async fn process_issue(
         }
     }
 
+    let _ = git_local::reset_to_base(config);
     git_local::delete_local_branch(config, &result.branch_name);
-    let _ = git_local::reset_to_main(config);
 
     true
 }
@@ -860,9 +1007,9 @@ fn find_placeholder(dev_res: &DeveloperResponse) -> Option<(String, String)> {
 
 fn truncate_to<S: AsRef<str>>(s: S, max_chars: usize) -> String {
     let s = s.as_ref();
-    if s.chars().count() <= max_chars {
-        return s.to_string();
+    if let Some((byte_idx, _)) = s.char_indices().nth(max_chars) {
+        format!("{}…[TRUNCATED]", &s[..byte_idx])
+    } else {
+        s.to_string()
     }
-    let cut: String = s.chars().take(max_chars).collect();
-    format!("{cut}…[TRUNCATED]")
 }
